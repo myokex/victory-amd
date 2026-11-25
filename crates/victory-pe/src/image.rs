@@ -424,8 +424,10 @@ mod tests {
             .find(|m| m.dll.eq_ignore_ascii_case("kernel32.dll"))
             .expect("Rust std imports kernel32");
         assert!(kernel32.entries.iter().all(|e| e.iat_slot_rva != 0));
-        // Rust std uses static TLS, so a TLS directory must be present (its
-        // callback array may legitimately be empty).
+        // On MSVC, Rust std uses static TLS so a TLS directory is always
+        // emitted; on GNU, std uses TlsAlloc and mingw-w64 only links `_tls_used`
+        // when referenced. `parses_tls_directory_and_callbacks` covers TLS on all targets.
+        #[cfg(target_env = "msvc")]
         assert!(info.tls.is_some());
     }
 
@@ -543,5 +545,31 @@ mod tests {
                 (Some("gamma"), 3, Some(0x1204))
             ]
         );
+    }
+
+    #[test]
+    fn parses_tls_directory_and_callbacks() {
+        let mut body = vec![0u8; 0x80];
+        let image_base = 0x1_8000_0000u64;
+        // IMAGE_TLS_DIRECTORY64 at RVA 0x1000; AddressOfCallBacks at +24 -> RVA 0x1040.
+        let callbacks_va = image_base + 0x1040;
+        body[layout::TLS64_ADDRESS_OF_CALLBACKS..layout::TLS64_ADDRESS_OF_CALLBACKS + 8]
+            .copy_from_slice(&callbacks_va.to_le_bytes());
+        body[0x40..0x48].copy_from_slice(&(image_base + 0x1100).to_le_bytes());
+        body[0x48..0x50].copy_from_slice(&(image_base + 0x1200).to_le_bytes());
+
+        let mut img = synthetic_image(&body);
+        let opt = layout::optional_header_offset(&img).unwrap();
+        // Clear synthetic_image's export directory and point the TLS directory at 0x1000.
+        img[opt + 112..opt + 120].fill(0);
+        let tls_dd = opt + layout::OPT_DATA_DIRECTORY + pe::IMAGE_DIRECTORY_ENTRY_TLS * 8;
+        img[tls_dd..tls_dd + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        img[tls_dd + 4..tls_dd + 8].copy_from_slice(&40u32.to_le_bytes());
+
+        let info = ImageInfo::parse(&img).unwrap();
+        let tls = info.tls.expect("TLS directory must be parsed");
+        assert_eq!(tls.directory_rva, 0x1000);
+        assert_eq!(tls.callbacks_va, callbacks_va);
+        assert_eq!(tls.callback_rvas, [0x1100, 0x1200]);
     }
 }
