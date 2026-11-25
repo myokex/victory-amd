@@ -850,7 +850,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if unlike(dst, src) {
+            if to == from || unlike(dst, src) {
                 return;
             }
             // A source the title fills itself is uploaded first (upstream
