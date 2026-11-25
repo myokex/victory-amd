@@ -50,6 +50,39 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     }
 }
 
+/// Pipelines skipped by key or shader hash (`VICTORY_SKIP_PIPELINES` or known
+/// AMD driver crashers such as `0629334fc89d66f8cd24f4f5d4b88871`).
+fn skipped_pipeline(key: &str, shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    const CRASHING_AMD_KEY: &str = "0629334fc89d66f8cd24f4f5d4b88871";
+    static ALLOW_CRASH: OnceLock<bool> = OnceLock::new();
+    static EXTRA_SKIPS: OnceLock<Vec<String>> = OnceLock::new();
+    let allow_crash = *ALLOW_CRASH
+        .get_or_init(|| std::env::var_os("VICTORY_ALLOW_CRASHING_PSO").is_some_and(|v| v == "1"));
+    if !allow_crash && key == CRASHING_AMD_KEY {
+        let names: Vec<String> = shaders.iter().map(|s| format!("{}:{}", s.stage, s.hash)).collect();
+        tracing::warn!(key, shaders = ?names, "skipping pipeline known to crash amdxc64.dll+0x861b9f");
+        return Some("crashes amdxc64.dll+0x861b9f, left out");
+    }
+    let extra = EXTRA_SKIPS.get_or_init(|| {
+        std::env::var("VICTORY_SKIP_PIPELINES")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    });
+    if !extra.is_empty()
+        && (extra.iter().any(|s| s == key)
+            || shaders.iter().any(|sh| extra.iter().any(|s| s == &sh.hash)))
+    {
+        let names: Vec<String> = shaders.iter().map(|s| format!("{}:{}", s.stage, s.hash)).collect();
+        tracing::warn!(key, shaders = ?names, "skipping pipeline via VICTORY_SKIP_PIPELINES");
+        return Some("skipped by VICTORY_SKIP_PIPELINES");
+    }
+    None
+}
+
 /// Whether some compute shader of `shaders` holds `name`.
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
     shaders
@@ -102,7 +135,8 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
-        let left_out = left_out(&shaders);
+        let key = key.finalize().to_hex()[..32].to_owned();
+        let left_out = left_out(&shaders).or_else(|| skipped_pipeline(&key, &shaders));
         Pending {
             shaders,
             graphics,
@@ -110,7 +144,7 @@ impl Pending {
             begun: OnceLock::new(),
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
+            key,
             used: AtomicBool::new(false),
         }
     }
