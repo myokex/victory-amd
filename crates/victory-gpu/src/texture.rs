@@ -286,6 +286,13 @@ struct Last {
     /// ([`Staging::unseen_write`]): it is hashed at every check until this
     /// frame.
     unguarded: u64,
+    /// The last read found pages of the texture not there (set and cleared
+    /// always; acted on only with [`missing_wait`]).
+    missing: bool,
+    /// With [`missing_wait`]: the guards said the texture's memory was
+    /// mapped or written since it was last read partly mapped, too soon to
+    /// read it again; it is read once [`MISSING_GAP`] frames have passed.
+    pending: bool,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -554,6 +561,167 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 3] = [const { std::sy
 /// its own time a frame beside 1,100-1,800 ms of "textures"): it waits.
 /// These say for what.
 pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Why textures' memory was read again since the last frame line, by
+/// [`WHY`]: textures, bytes read, microseconds, and of the textures those
+/// given to the card again.
+pub(crate) static REREAD: [[std::sync::atomic::AtomicU64; 4]; 5] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; 5];
+
+thread_local! {
+    /// The refresh under way on this thread: why it reads (0 the write
+    /// watch says written, 1 the guards say written, 2 unwritten but its
+    /// turn to be hashed, 3 a movie's plane or one that changed unseen, 4
+    /// part of its pages are not there), and whether it was detiled.
+    static WHY: std::cell::Cell<(usize, bool)> = const { std::cell::Cell::new((0, false)) };
+}
+
+/// Since the last frame line, refreshes the switches below spared: write-
+/// watch askings not made for view memory ([`skip_failed_ask`]); with
+/// [`missing_wait`], partly mapped textures not read because nothing was
+/// mapped or written in their range since their last read, those whose
+/// signal was held for later (read again too soon), those read by the
+/// safety fallback with no signal, and of the partly mapped ones read, those
+/// not detiled because the bytes the staging buffer takes were as before:
+/// of textures with levels on demand (judged by their held levels only),
+/// and of the others (hashed whole); last, partly mapped textures the guards
+/// say nothing of (not view memory), read on the old timer.
+pub(crate) static SKIPS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// A frame count from the environment: `value` parsed, at least 1, else
+/// `default`.
+fn frames_from(value: Option<&std::ffi::OsStr>, default: u64) -> u64 {
+    value
+        .and_then(|v| v.to_str())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(default)
+}
+
+/// Every how many frames a guarded texture nothing wrote is hashed anyway,
+/// on its turn (`VICTORY_TEXTURE_TURN=<frames>`; 8 when unset). The hash
+/// is what finds a write through another view of the same physical page,
+/// which the guard of this view does not see: with a longer period such a
+/// write shows up later (up to that many frames). Tonight's counters: 35
+/// textures, 33.6 MB and 7.4 ms a frame hashed on their turn indoors, none
+/// of them changed.
+fn hash_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| frames_from(std::env::var_os("VICTORY_TEXTURE_TURN").as_deref(), 8))
+}
+
+/// Whether the write-watch asking is skipped for memory the runtime told
+/// us is a view of physical pages (`VICTORY_TEXTURE_SKIP_FAILED_ASK=1`;
+/// off by default). The kernel's write watch only covers private memory
+/// allocated with it: for a view the asking can only fail (some 500 failed
+/// askings a frame, each a kernel call), after which the guards answer.
+/// The view is looked up in the runtime's views (`crate::inplace`) by the
+/// texture's first byte. Risk: a view the runtime unmapped and did not
+/// report (`crate::title_memory_remapped` forgets views) would be passed to
+/// the guards, which ask the kernel themselves for memory they do not know
+/// as a view.
+fn skip_failed_ask() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SKIP_FAILED_ASK").is_some_and(|v| v == "1"))
+}
+
+/// Whether a partly mapped texture waits for a sign before it is read
+/// again (`VICTORY_TEXTURE_MISSING_WAIT=1`; off by default: read again at
+/// most every [`MISSING_GAP`] frames, whatever happened).
+///
+/// Tonight's counters, camera still indoors: 15.5 partly mapped textures,
+/// 35.5 MB and 8.9 ms a frame read again (76 MB, 19 ms while driving), all
+/// detiled and given to the card again. With the switch, for a texture
+/// in view memory (the guards answer for it), it is read again only when
+/// the guards say its range was mapped, remapped or written since its last
+/// read (the runtime's mappings and DirectStorage writes clear the guards
+/// of the range: `crate::title_memory_remapped`, `title_memory_written`),
+/// still at most every [`MISSING_GAP`] frames, the sign kept meanwhile;
+/// and without a sign every [`missing_every`] frames (a write through
+/// another view of the same pages is seen only then). Memory the guards
+/// say nothing of is read as before.
+///
+/// And when it is read, what is compared with the last read is what the
+/// staging buffer takes from it: for a texture with levels on demand only
+/// its held levels (and which they are), not the bytes of levels that are
+/// zeros in the staging buffer anyway (levels not all mapped yet, above
+/// the first viewed one, or where the next texture starts). Those bytes
+/// were hashed too, so a texture whose levels stream in, or that lies over
+/// another texture's memory, was detiled and uploaded again at every read
+/// with nothing of its own changed.
+fn missing_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_MISSING_WAIT").is_some_and(|v| v == "1"))
+}
+
+/// With [`missing_wait`]: every how many frames a partly mapped texture
+/// with no sign is read anyway (`VICTORY_TEXTURE_MISSING_EVERY=<frames>`;
+/// 120 when unset).
+fn missing_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| frames_from(std::env::var_os("VICTORY_TEXTURE_MISSING_EVERY").as_deref(), 120))
+}
+
+/// The fewest frames between two reads of a partly mapped texture.
+const MISSING_GAP: u64 = 30;
+
+/// What a refresh does with a texture that was partly mapped at its last
+/// read ([`missing_wait`]).
+#[derive(Debug, PartialEq, Eq)]
+enum MissingDue {
+    /// Nothing to do: no sign and the fallback is not due.
+    Skip,
+    /// A sign came too soon after the last read: kept for later.
+    Hold,
+    /// Read now: on a sign (false) or by the fallback (true).
+    Read(bool),
+}
+
+/// [`MissingDue`] of a texture read partly mapped `since` frames ago, when
+/// the guards say something was mapped or written in its range (`sign`),
+/// or a sign was held (`pending`).
+fn missing_due(sign: bool, pending: bool, since: u64, gap: u64, every: u64) -> MissingDue {
+    if sign || pending {
+        if since >= gap { MissingDue::Read(false) } else { MissingDue::Hold }
+    } else if since >= every {
+        MissingDue::Read(true)
+    } else {
+        MissingDue::Skip
+    }
+}
+
+/// The byte ranges of a slice's levels in the console layout, as
+/// [`Staging::held_levels`] judges them: `(levels, from, to)` for each
+/// level before the tail, then one for the tail levels together, which
+/// share the first block.
+fn level_spans(offsets: &[u64], first_tail: usize, slice_size: u64, alignment: u64) -> Vec<(u32, u64, u64)> {
+    let tail = first_tail.min(offsets.len());
+    let mut spans = Vec::with_capacity(tail + 1);
+    for level in 0..tail.min(32) {
+        let end = if level == 0 { slice_size } else { offsets[level - 1] };
+        spans.push((1u32 << level, offsets[level], end));
+    }
+    if tail < offsets.len() {
+        let levels = (tail..offsets.len().min(32)).fold(0u32, |m, l| m | 1 << l);
+        spans.push((levels, 0, alignment.min(slice_size)));
+    }
+    spans
+}
+
+/// A hash of what the staging buffer takes from `tiled`: the `held`
+/// levels and the bytes of their `spans` ([`level_spans`]).
+fn held_hash(tiled: &[u8], held: u32, spans: &[(u32, u64, u64)]) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&held.to_le_bytes());
+    for &(levels, from, to) in spans {
+        if levels & held == 0 {
+            continue;
+        }
+        let to = (to as usize).min(tiled.len());
+        let from = (from as usize).min(to);
+        hasher.update(&tiled[from..to]);
+    }
+    hasher.finalize()
+}
 
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
@@ -1122,6 +1290,27 @@ impl Staging {
         held
     }
 
+    /// With [`missing_wait`], of a partly mapped texture's read `tiled`: a
+    /// hash of what the staging buffer takes from it, and whether that is
+    /// all of it (hashed whole, as without the switch). With levels on
+    /// demand that is the held levels ([`Staging::held_levels`], judged as
+    /// [`Staging::detile`] judges them) and their bytes; the others are
+    /// zeros in the staging buffer whatever lies in their memory.
+    fn staged_hash(&self, tiled: &[u8]) -> (blake3::Hash, bool) {
+        let held = if self.on_demand { self.held_levels(self.judgement()) } else { u32::MAX };
+        if held == u32::MAX {
+            return (blake3::hash(tiled), true);
+        }
+        let offsets: Vec<u64> = self.layout.mips.iter().map(|m| m.offset).collect();
+        let spans = level_spans(
+            &offsets,
+            self.layout.first_tail_mip as usize,
+            self.layout.slice_size,
+            self.layout.alignment,
+        );
+        (held_hash(tiled, held, &spans), false)
+    }
+
     /// Forgets what the staging buffer was last filled from: the next
     /// refresh detiles anew, whether the memory changed or not.
     fn forget(&self) {
@@ -1159,8 +1348,15 @@ impl Staging {
     /// Returns the bytes of title memory read.
     fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
+        WHY.set((0, false));
         let read = self.refresh_timed();
         let us = whole.elapsed().as_micros() as u64;
+        if read != 0 {
+            let (why, detiled) = WHY.get();
+            for (n, v) in REREAD[why].iter().zip([1, read as u64, us, u64::from(detiled)]) {
+                n.fetch_add(v, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         REFRESH_WAITS[3].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
         crate::framelog::add(crate::framelog::T::RefreshUs, us);
         read
@@ -1171,7 +1367,14 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+        // View memory has no write watch: the asking would only fail
+        // (`skip_failed_ask`).
+        let view = skip_failed_ask() && !crate::inplace::views_between(start, start + 1).is_empty();
+        if view {
+            SKIPS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let watched = if view { None } else { waited(1, || crate::watch::writes(start, start + size, false)) };
+        if let Some((now, written)) = watched {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -1202,22 +1405,66 @@ impl Staging {
         // that only changed every eighth frame, one old picture after
         // another on the screen).
         let mut unseen = false;
+        // What the guards said (`missing_wait`): something was mapped or
+        // written in the range since the last asking. None: not asked.
+        let mut sign = None;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
+            // `VICTORY_TEXTURE_TURN` (`hash_every`), 8 frames when unset.
+            let hash_every = hash_every();
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
-            let turn = frame.wrapping_add((start >> 16) as u64) % HASH_EVERY == 0;
+            let turn = frame.wrapping_add((start >> 16) as u64) % hash_every == 0;
             // Linear pictures of one level are what the processor draws (the
             // planes of a movie), through a view of its own.
             let desc = &self.layout.desc;
             let film = desc.swizzle.0 == 0 && desc.mips == 1;
-            if unwritten && !turn && !film && frame >= last.unguarded {
+            sign = Some(!(unwritten && !film && frame >= last.unguarded));
+            // A sign held for a partly mapped texture is looked at below.
+            let held = missing_wait() && last.missing && last.pending;
+            if unwritten && !turn && !film && frame >= last.unguarded && !held {
                 return 0;
             }
             unseen = unwritten;
+            let why = match (unwritten, film || frame < last.unguarded) {
+                (false, _) => 1,
+                (true, true) => 3,
+                (true, false) => 2,
+            };
+            WHY.set((why, false));
+        }
+        // A texture partly mapped at its last read, in memory the guards
+        // answer for: read again on their sign, or by the fallback
+        // (`missing_wait`). Decided before title memory is held still: no
+        // sign, no read, and no failed read through the kernel while the
+        // runtime remaps.
+        let mut due = false;
+        if missing_wait()
+            && last.missing
+            && let (Some(sign), Some(at)) = (sign, last.partial)
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let since = crate::frame::current().saturating_sub(at);
+            match missing_due(sign, last.pending, since, MISSING_GAP, missing_every()) {
+                MissingDue::Skip => {
+                    SKIPS[1].fetch_add(1, Relaxed);
+                    return 0;
+                }
+                MissingDue::Hold => {
+                    last.pending = true;
+                    SKIPS[2].fetch_add(1, Relaxed);
+                    return 0;
+                }
+                MissingDue::Read(fallback) => {
+                    last.pending = false;
+                    if fallback {
+                        SKIPS[3].fetch_add(1, Relaxed);
+                    }
+                    due = true;
+                }
+            }
         }
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
@@ -1253,16 +1500,25 @@ impl Staging {
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            if !due && last.partial.is_some_and(|at| frame < at + MISSING_GAP) {
                 return 0;
             }
+            if missing_wait() && sign.is_none() {
+                SKIPS[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             last.partial = Some(frame);
+            last.missing = true;
+            last.pending = false;
+            WHY.set((4, false));
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
+                let (hash, whole) = if missing_wait() { self.staged_hash(read) } else { (blake3::hash(read), true) };
                 if last.hash == Some(hash) {
+                    if missing_wait() {
+                        SKIPS[if whole { 5 } else { 4 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     return false;
                 }
                 last.hash = Some(hash);
@@ -1279,6 +1535,7 @@ impl Staging {
             let _ = changed;
             return size;
         }
+        last.missing = false;
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
                 let hash = blake3::hash(tiled);
@@ -1368,6 +1625,8 @@ impl Staging {
         });
         if read {
             UNLOCKED[0].fetch_add(1, Relaxed);
+            // All of it was there.
+            last.missing = false;
             size
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);
@@ -1397,6 +1656,7 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        WHY.set((WHY.get().0, true));
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
@@ -1941,5 +2201,73 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod spare_tests {
+    use super::{MissingDue, frames_from, held_hash, level_spans, missing_due};
+
+    #[test]
+    fn frame_counts_come_from_the_environment_or_the_default() {
+        let os = |v: &str| std::ffi::OsString::from(v);
+        assert_eq!(frames_from(None, 8), 8);
+        assert_eq!(frames_from(Some(&os("32")), 8), 32);
+        assert_eq!(frames_from(Some(&os(" 120 ")), 8), 120);
+        assert_eq!(frames_from(Some(&os("0")), 8), 8);
+        assert_eq!(frames_from(Some(&os("x")), 8), 8);
+    }
+
+    #[test]
+    fn a_partly_mapped_texture_is_read_on_a_sign_or_by_the_fallback() {
+        // A sign: read once the gap has passed, held before.
+        assert_eq!(missing_due(true, false, 5, 30, 120), MissingDue::Hold);
+        assert_eq!(missing_due(true, false, 30, 30, 120), MissingDue::Read(false));
+        // A held sign counts as one.
+        assert_eq!(missing_due(false, true, 29, 30, 120), MissingDue::Hold);
+        assert_eq!(missing_due(false, true, 31, 30, 120), MissingDue::Read(false));
+        // No sign: nothing until the fallback.
+        assert_eq!(missing_due(false, false, 30, 30, 120), MissingDue::Skip);
+        assert_eq!(missing_due(false, false, 119, 30, 120), MissingDue::Skip);
+        assert_eq!(missing_due(false, false, 120, 30, 120), MissingDue::Read(true));
+    }
+
+    #[test]
+    fn levels_span_their_bytes_and_the_tail_shares_the_first_block() {
+        // Level 0 last, then level 1, level 2 first after the tail block;
+        // levels 3 and 4 in the tail.
+        let offsets = [0x30000, 0x20000, 0x10000, 0, 0];
+        let spans = level_spans(&offsets, 3, 0x70000, 0x10000);
+        assert_eq!(
+            spans,
+            vec![(1, 0x30000, 0x70000), (2, 0x20000, 0x30000), (4, 0x10000, 0x20000), (0b11000, 0, 0x10000)]
+        );
+        // No tail.
+        assert_eq!(level_spans(&[0x1000, 0], 2, 0x5000, 0x1000), vec![(1, 0x1000, 0x5000), (2, 0, 0x1000)]);
+    }
+
+    #[test]
+    fn only_held_levels_count_for_the_staged_hash() {
+        let spans = level_spans(&[0x3000, 0x2000, 0x1000, 0], 3, 0x7000, 0x1000);
+        let mut tiled = vec![7u8; 0x7000];
+        // Levels 1, 2 and the tail held; level 0 not (not all mapped).
+        let held = 0b1110;
+        let before = held_hash(&tiled, held, &spans);
+        // Level 0's bytes (zeros in the staging buffer) change.
+        tiled[0x5000] = 1;
+        assert_eq!(held_hash(&tiled, held, &spans), before);
+        // A held level's bytes change.
+        tiled[0x2800] = 1;
+        assert_ne!(held_hash(&tiled, held, &spans), before);
+        tiled[0x2800] = 7;
+        // The tail changes.
+        tiled[0x10] = 1;
+        assert_ne!(held_hash(&tiled, held, &spans), before);
+        tiled[0x10] = 7;
+        assert_eq!(held_hash(&tiled, held, &spans), before);
+        // Which levels are held changes: detiled again.
+        assert_ne!(held_hash(&tiled, held | 1, &spans), before);
+        // A span past the read is cut to it.
+        let _ = held_hash(&tiled[..0x4000], held | 1, &spans);
     }
 }

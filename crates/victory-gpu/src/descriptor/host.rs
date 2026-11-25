@@ -105,6 +105,19 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// `VICTORY_SYNC_SKIP=1` ([`sync_skip`]): what the pass over records
+    /// copied in as bytes keeps of this heap's pages and slots from one
+    /// pass to the next ([`SkipState`]). Empty until it first looks at a
+    /// page of this heap; only placed shader-visible heaps the pass syncs
+    /// ever have pages kept.
+    skip: Mutex<SkipState>,
+    /// Slots whose fingerprint [`HostHeap::forget_copied`] cleared since
+    /// the pass last looked (and whether more than [`FORGOTTEN_MAX`] were,
+    /// which drops every page kept): their pages are walked again. Noted
+    /// only once the pass keeps pages of this heap (`skip_live`).
+    forgotten: Mutex<(Vec<u32>, bool)>,
+    /// Whether [`HostHeap::skip_begin`] ran for this heap.
+    skip_live: std::sync::atomic::AtomicBool,
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -1024,6 +1037,9 @@ impl HostHeap {
                 }
                 spans
             },
+            skip: Mutex::default(),
+            forgotten: Mutex::default(),
+            skip_live: std::sync::atomic::AtomicBool::new(false),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1476,9 +1492,24 @@ impl HostHeap {
     /// raw-byte copy back to an earlier record is not mistakenly skipped.
     /// Must never be called while holding `self.made`.
     fn forget_copied(&self, index: u32) {
-        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = copied.get_mut(index as usize) {
-            *slot = 0;
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slot) = copied.get_mut(index as usize) {
+                *slot = 0;
+            }
+        }
+        // `VICTORY_SYNC_SKIP=1`: the page the slot is on is no longer the
+        // page whose records were all as last mirrored, whatever its bytes
+        // say (the lock of `copied` is let go first: the pass takes it
+        // under its own, and never this one under it).
+        if self.skip_live.load(std::sync::atomic::Ordering::Acquire) {
+            let mut forgotten = self.forgotten.lock().unwrap_or_else(|e| e.into_inner());
+            if forgotten.0.len() >= FORGOTTEN_MAX {
+                forgotten.0.clear();
+                forgotten.1 = true;
+            } else if !forgotten.1 {
+                forgotten.0.push(index);
+            }
         }
     }
 
@@ -2044,7 +2075,20 @@ impl HostHeap {
         page: &[u8],
         straddling: impl Fn(u64, &mut [u8; 32]) -> bool,
     ) -> (u64, u64) {
-        let (frame, tables) = (crate::frame::current(), sync_tables());
+        self.mirror_copied_page_at(slots, (start, step), from, page, straddling, crate::frame::current())
+    }
+
+    /// [`HostHeap::mirror_copied_page`] in frame `frame`.
+    fn mirror_copied_page_at(
+        &self,
+        slots: std::ops::Range<u64>,
+        (start, step): (u64, u64),
+        from: usize,
+        page: &[u8],
+        straddling: impl Fn(u64, &mut [u8; 32]) -> bool,
+        frame: u64,
+    ) -> (u64, u64) {
+        let tables = sync_tables();
         let mut looked = 0u64;
         // Slot, handle, the record's first words, its fingerprint, and
         // whether it holds nothing in a slot never looked at: that one is
@@ -2137,6 +2181,289 @@ impl HostHeap {
             self.forget_copied(stale);
         }
         (looked, mirrored)
+    }
+
+    /// `VICTORY_SYNC_SKIP=1` ([`sync_skip`]): the start of pass `pass` over
+    /// this heap's changed pages (`super::sync_heaps`), the title heap's
+    /// first record at `start`, one every `step` bytes. The slots whose
+    /// fingerprint was forgotten since the last pass
+    /// ([`HostHeap::forget_copied`]) are walked again, and their pages are
+    /// not skipped whatever their bytes say: those slots are not as last
+    /// mirrored any more, though the title's bytes there did not change.
+    pub(crate) fn skip_begin(&self, (start, step): (u64, u64), pass: u64) {
+        use std::sync::atomic::Ordering::{Relaxed, Release};
+        // First, so that a slot forgotten from here on is noted for the
+        // next pass if not this one.
+        self.skip_live.store(true, Release);
+        let (forgotten, overflow) = {
+            let mut forgotten = self.forgotten.lock().unwrap_or_else(|e| e.into_inner());
+            (std::mem::take(&mut forgotten.0), std::mem::replace(&mut forgotten.1, false))
+        };
+        let mut skip = self.skip.lock().unwrap_or_else(|e| e.into_inner());
+        skip.pass = pass;
+        skip.size(self.count);
+        if overflow {
+            skip.clear_pages();
+        }
+        let page_of = |at: u64| at as usize & !(crate::watch::PAGE - 1);
+        for index in forgotten {
+            if let Some(held) = skip.held.get_mut(index as usize) {
+                *held = HELD_WALK;
+            }
+            let first = start + u64::from(index) * step;
+            for at in [first, first + step.max(1) - 1] {
+                if let Some(page) = skip.pages.get_mut(&page_of(at)) {
+                    page.walk = true;
+                }
+            }
+            SKIP_COUNTS[4].fetch_add(1, Relaxed);
+        }
+    }
+
+    /// `VICTORY_SYNC_SKIP=1`: [`HostHeap::mirror_copied_page`] for a page
+    /// whose bytes are compared with the copy last read of it (kept here,
+    /// per page of this heap's title memory). The same records are
+    /// mirrored as there, and in the same order; left unread are only
+    /// records that would have been found as they were:
+    ///
+    /// - The whole page, if its bytes are the ones last read, no slot on it
+    ///   was forgotten since or has to be walked each time (`walk`), and
+    ///   every slot on it left to the tables is a table's still (`oldest`):
+    ///   naixue2233, fxceless PR 783 (`d695015e`), with the kept pages per
+    ///   heap rather than by address, so they go with their heap.
+    /// - On a page that changed, the records outside the bytes that differ
+    ///   (naixue2233, `c6060592`) that were settled (fingerprint equal to
+    ///   the record) or left to a table whose stamp has not run out since;
+    ///   but a settled slot whose fingerprint is 0 is walked whatever its
+    ///   bytes say (`needs_mirror` in `c6060592`: without it, descriptors
+    ///   went stale there).
+    ///
+    /// `frame` is the frame of the pass; `revisit`: the page is not one
+    /// the kernel called written, but one whose table slots ran out
+    /// ([`HostHeap::skip_revisits`]): only those are walked, and only if
+    /// the page's bytes are the ones last read (any other change waits for
+    /// the page's write, as without the switch). `due` is the caller's
+    /// list, reused from page to page (UwUCammie, fxceless PR 1043; Nazar
+    /// Ukolov, VIctory `7f475db6`: no vectors made per pass).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn mirror_copied_page_skip(
+        &self,
+        slots: std::ops::Range<u64>,
+        (start, step): (u64, u64),
+        from: usize,
+        page: &[u8],
+        straddling: impl Fn(u64, &mut [u8; 32]) -> bool,
+        frame: u64,
+        revisit: bool,
+        due: &mut Vec<Due>,
+    ) -> Skipped {
+        let tables = sync_tables();
+        let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
+        let mut out = Skipped::default();
+        let key = from & !(crate::watch::PAGE - 1);
+        let mut guard = self.skip.lock().unwrap_or_else(|e| e.into_inner());
+        let skip = &mut *guard;
+        skip.size(self.count);
+        let pass = skip.pass;
+        // None: no copy of the page; Some((None, ..)): the bytes are the
+        // ones last read; Some((Some(span), ..)): they differ within `span`.
+        let before = skip
+            .pages
+            .get(&key)
+            .filter(|kept| kept.from == from && kept.bytes.len() == page.len())
+            .map(|kept| (difference(&kept.bytes, page), kept.walk, kept.oldest));
+        if let Some((diff, walk, oldest)) = before
+            && page_skips(diff.is_none(), walk, oldest, now)
+        {
+            if let Some(kept) = skip.pages.get_mut(&key) {
+                kept.pass = pass;
+            }
+            out.page_skipped = true;
+            return out;
+        }
+        if revisit && !matches!(before, Some((None, ..))) {
+            return out;
+        }
+        let diff = before.map(|(diff, ..)| diff);
+        let held = &mut skip.held;
+        let step_len = step as usize;
+        due.clear();
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if copied.is_empty() {
+                copied.resize(self.count as usize, 0);
+            }
+            for index in slots.clone() {
+                let i = index as usize;
+                if i >= held.len() {
+                    continue;
+                }
+                let handle = start + index * step;
+                let at = (handle as usize).checked_sub(from);
+                // The record's bytes are the ones read last time.
+                let unchanged = diff.is_some_and(|diff| at.is_some_and(|at| record_unchanged(at, step_len, page.len(), diff)));
+                if unchanged {
+                    match held_unchanged(held[i], now) {
+                        Unchanged::Settled if revisit || copied.get(i).is_some_and(|&print| print != 0) => {
+                            out.unchanged += 1;
+                            continue;
+                        }
+                        // Never mirrored here, or forgotten since:
+                        // `needs_mirror` (c6060592).
+                        Unchanged::Settled => {}
+                        Unchanged::Deferred => {
+                            out.deferred += 1;
+                            continue;
+                        }
+                        // On a page looked at only for its tables: a slot
+                        // walked each time waits for the page's write.
+                        Unchanged::Walk if revisit && held[i] == HELD_WALK => {
+                            out.unchanged += 1;
+                            continue;
+                        }
+                        Unchanged::Walk => {}
+                    }
+                }
+                let mut whole = [0u8; 32];
+                let record = match at.and_then(|at| page.get(at..at + step_len)) {
+                    Some(record) => record,
+                    None => {
+                        if step_len > whole.len() || !straddling(handle, &mut whole) {
+                            held[i] = HELD_WALK;
+                            continue;
+                        }
+                        &whole[..step_len]
+                    }
+                };
+                out.looked += 1;
+                let Some(last) = copied.get_mut(i) else {
+                    held[i] = HELD_WALK;
+                    continue;
+                };
+                let Some(header) = record.first_chunk::<12>() else {
+                    held[i] = HELD_WALK;
+                    continue;
+                };
+                // Never 0, which is "never looked at".
+                let print = record_print(record) | 1;
+                if *last == print {
+                    held[i] = HELD_SETTLED;
+                    continue;
+                }
+                // A table's slot lately: left to its draws, and looked at
+                // again when its bytes change or its stamp runs out.
+                if !tables && self.tabled_lately(index as u32, frame) {
+                    COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    held[i] = deferred_stamp(self.tabled_stamp(index as u32));
+                    continue;
+                }
+                let words = |at: usize| u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]]);
+                // A draw's table has it lately: left to the draws, and
+                // looked at every time (that stamp lasts two frames, and
+                // whether the record is a buffer's can change with it).
+                if table_buffers()
+                    && self.buffer_tabled_lately(index as u32, frame)
+                    && words(0) == VIEW_TAG
+                    && view_at(words(4), words(8)).is_some_and(|v| v.is_buffer() || matches!(v, View::Constant(..)))
+                {
+                    BUFFERS_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    held[i] = HELD_WALK;
+                    continue;
+                }
+                let unseen_nothing = *last == 0 && record.iter().all(|&b| b == 0);
+                if !unseen_nothing {
+                    *last = print;
+                }
+                // Settled: its fingerprint is the record's, or it holds
+                // nothing in a slot never made (made since only by a call,
+                // which forgets the fingerprint; and walked anyway while it
+                // is 0).
+                held[i] = HELD_SETTLED;
+                due.push((index as u32, handle, [words(0), words(4), words(8)], print, unseen_nothing));
+            }
+        }
+        // What the page keeps, for the next pass to skip it or not.
+        let page_end = from + page.len();
+        let (mut walk, mut oldest) = (false, 0u32);
+        for index in slots {
+            let handle = (start + index * step) as usize;
+            // A record across the page's ends has bytes the copy lacks.
+            if handle < from || handle + step_len > page_end {
+                walk = true;
+            }
+            match held.get(index as usize).copied() {
+                None | Some(HELD_WALK) => walk = true,
+                Some(HELD_SETTLED) => {}
+                Some(stamp) => oldest = older_stamp(oldest, stamp, now),
+            }
+        }
+        skip.keep(key, from, page, walk, oldest, pass);
+        drop(guard);
+        let (looked, mirrored) = self.mirror_due(due, out.looked);
+        out.looked = looked;
+        out.mirrored = mirrored;
+        out
+    }
+
+    /// The second half of [`HostHeap::mirror_copied_page`], for
+    /// [`HostHeap::mirror_copied_page_skip`]: the records `due` mirrored,
+    /// as there. Returns `looked` and the records mirrored.
+    fn mirror_due(&self, due: &[Due], looked: u64) -> (u64, u64) {
+        if due.is_empty() {
+            return (looked, 0);
+        }
+        let mut mirrored = 0u64;
+        let mut seen: Vec<(u32, u64)> = Vec::new();
+        let mut stale_unmade: Vec<u32> = Vec::new();
+        {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            for &(index, handle, words, print, unseen_nothing) in due {
+                if unseen_nothing {
+                    if made.get(index as usize).is_none_or(|&key| key == 0) {
+                        continue;
+                    }
+                    seen.push((index, print));
+                }
+                #[cfg(feature = "diagnostics")]
+                self.count_copied(index, words);
+                let mut changed = false;
+                let _ = self.mirror_record_in(&mut made, index, handle, false, words, &mut stale_unmade, &mut changed, true);
+                mirrored += 1;
+            }
+        }
+        if !seen.is_empty() {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            for (index, print) in seen {
+                if let Some(last) = copied.get_mut(index as usize) {
+                    *last = print;
+                }
+            }
+        }
+        for stale in stale_unmade {
+            self.forget_copied(stale);
+        }
+        (looked, mirrored)
+    }
+
+    /// `VICTORY_SYNC_SKIP=1`, once a frame (`frame`): the kept pages (start
+    /// and length) the pass did not look at in this pass and that hold a
+    /// slot left to a table whose stamp may have run out. Without the
+    /// switch such a slot is mirrored at the next write of its page; here
+    /// it is looked at even if the page is not written again
+    /// ([`HostHeap::mirror_copied_page_skip`] with `revisit`).
+    pub(crate) fn skip_revisits(&self, frame: u64) -> Vec<(usize, usize)> {
+        let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
+        let mut skip = self.skip.lock().unwrap_or_else(|e| e.into_inner());
+        if skip.revisited == frame.wrapping_add(1) {
+            return Vec::new();
+        }
+        skip.revisited = frame.wrapping_add(1);
+        let pass = skip.pass;
+        skip.pages
+            .values()
+            .filter(|kept| kept.pass != pass && kept.oldest != 0 && !stamp_lately(kept.oldest, now))
+            .map(|kept| (kept.from, kept.bytes.len()))
+            .collect()
     }
 
     /// Measured (diagnostics): what the records mirrored by
@@ -2649,6 +2976,204 @@ pub(crate) static COPIED_WHAT: [std::sync::atomic::AtomicU64; 74] = [const { std
 /// Since the last frame line: slots on changed heap pages that
 /// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
 pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A record [`HostHeap::mirror_copied_page_skip`] mirrors once the page's
+/// walk is done: slot, handle, the record's first words, its fingerprint,
+/// and whether it holds nothing in a slot never looked at.
+pub(crate) type Due = (u32, u64, [u32; 3], u64, bool);
+
+/// Whether the pass over records copied in as bytes leaves unread the pages
+/// and records it would find as they were (`VICTORY_SYNC_SKIP=1`; off by
+/// default): [`HostHeap::mirror_copied_page_skip`].
+pub(crate) fn sync_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_SKIP").is_some_and(|v| v == "1"))
+}
+
+/// What [`HostHeap::mirror_copied_page_skip`] did with one page.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Skipped {
+    /// Records read and fingerprinted.
+    pub(crate) looked: u64,
+    /// Of those, mirrored.
+    pub(crate) mirrored: u64,
+    /// The page's bytes were the ones last read, and nothing on it was due.
+    pub(crate) page_skipped: bool,
+    /// Records left unread: their bytes did not change and they were
+    /// mirrored as they are (or, on a revisit, wait for the page's write).
+    pub(crate) unchanged: u64,
+    /// Records left unread: their bytes did not change and they are left
+    /// to a table whose stamp has not run out.
+    pub(crate) deferred: u64,
+}
+
+/// Since the last frame line (`VICTORY_SYNC_SKIP=1`): pages skipped whole,
+/// records left unread as settled, records left unread as a table's,
+/// pages revisited for tables that ran out, slots forgotten and walked
+/// again.
+pub(crate) static SKIP_COUNTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Bytes the [`SkipState`]s of all heaps keep: copies of pages, and a word
+/// per slot.
+pub(crate) static SKIP_KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// More slots forgotten between two passes than this drops every kept
+/// page of the heap: they are read whole again.
+const FORGOTTEN_MAX: usize = 1 << 16;
+
+/// [`SkipState::held`]: the slot's fingerprint is its record's (or it
+/// holds nothing and was never made): unchanged bytes are done with.
+const HELD_SETTLED: u32 = 0;
+/// [`SkipState::held`]: walked whenever its page is (left to a buffer's
+/// table, unread, forgotten). Any other value is the table stamp the slot
+/// had when it was left to its table (never this: the stamp's top bit,
+/// [`TABLED_READ`], is cleared).
+const HELD_WALK: u32 = u32::MAX;
+
+/// What one heap keeps between passes (`VICTORY_SYNC_SKIP=1`).
+#[derive(Default)]
+struct SkipState {
+    /// Per title slot: [`HELD_SETTLED`], [`HELD_WALK`], or a table stamp.
+    held: Vec<u32>,
+    /// By 64 KiB page of the title heap's memory: the bytes last read.
+    pages: std::collections::HashMap<usize, KeptPage>,
+    /// The pass ([`HostHeap::skip_begin`]).
+    pass: u64,
+    /// The frame (plus one) of the last [`HostHeap::skip_revisits`].
+    revisited: u64,
+}
+
+/// A page of the title heap as [`HostHeap::mirror_copied_page_skip`] last
+/// read it.
+struct KeptPage {
+    /// Where the bytes start (the page's, or the heap's start in it).
+    from: usize,
+    bytes: Box<[u8]>,
+    /// A slot on it is walked each time, or a record crosses its ends.
+    walk: bool,
+    /// The oldest table stamp of its slots left to tables (0: none).
+    oldest: u32,
+    /// The pass that last looked at it.
+    pass: u64,
+}
+
+impl SkipState {
+    /// `held` for `count` slots.
+    fn size(&mut self, count: u32) {
+        if self.held.len() < count as usize {
+            let more = count as usize - self.held.len();
+            self.held.resize(count as usize, HELD_SETTLED);
+            SKIP_KEPT.fetch_add((more * size_of::<u32>()) as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Keeps `page`, read from `from`, as the page at `key`.
+    fn keep(&mut self, key: usize, from: usize, page: &[u8], walk: bool, oldest: u32, pass: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        match self.pages.get_mut(&key) {
+            Some(kept) if kept.bytes.len() == page.len() => {
+                kept.bytes.copy_from_slice(page);
+                (kept.from, kept.walk, kept.oldest, kept.pass) = (from, walk, oldest, pass);
+            }
+            _ => {
+                let bytes: Box<[u8]> = page.into();
+                SKIP_KEPT.fetch_add(bytes.len() as u64, Relaxed);
+                if let Some(old) = self.pages.insert(key, KeptPage { from, bytes, walk, oldest, pass }) {
+                    SKIP_KEPT.fetch_sub(old.bytes.len() as u64, Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Forgets every kept page.
+    fn clear_pages(&mut self) {
+        let bytes: usize = self.pages.values().map(|kept| kept.bytes.len()).sum();
+        SKIP_KEPT.fetch_sub(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+        self.pages.clear();
+    }
+}
+
+impl Drop for SkipState {
+    fn drop(&mut self) {
+        self.clear_pages();
+        SKIP_KEPT.fetch_sub((self.held.len() * size_of::<u32>()) as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// What a slot whose record's bytes did not change needs
+/// ([`held_unchanged`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unchanged {
+    /// Nothing: its fingerprint is the record's.
+    Settled,
+    /// Nothing yet: it is left to a table, whose stamp has not run out.
+    Deferred,
+    /// A walk: whatever the bytes, the record may be due.
+    Walk,
+}
+
+/// [`Unchanged`] for a slot that holds `held` ([`SkipState::held`]) in the
+/// frame whose stamp is `now`.
+fn held_unchanged(held: u32, now: u32) -> Unchanged {
+    match held {
+        HELD_SETTLED => Unchanged::Settled,
+        HELD_WALK => Unchanged::Walk,
+        stamp if stamp_lately(stamp, now) => Unchanged::Deferred,
+        _ => Unchanged::Walk,
+    }
+}
+
+/// Whether a slot stamped `stamp` is a table's lately in the frame whose
+/// stamp is `now`, as [`HostHeap::tabled_lately`] says: stamps only move
+/// forward, so a slot lately by an older stamp of its own is lately by
+/// the one it has now.
+fn stamp_lately(stamp: u32, now: u32) -> bool {
+    stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES
+}
+
+/// The stamp of a slot left to a table, as [`SkipState::held`] keeps it.
+fn deferred_stamp(stamp: u32) -> u32 {
+    match stamp & !TABLED_READ {
+        0 => HELD_WALK,
+        stamp => stamp,
+    }
+}
+
+/// Of two table stamps (0: none), the one that runs out first.
+fn older_stamp(a: u32, b: u32, now: u32) -> u32 {
+    match (a, b) {
+        (0, b) => b,
+        (a, 0) => a,
+        (a, b) if now.wrapping_sub(a) >= now.wrapping_sub(b) => a,
+        (_, b) => b,
+    }
+}
+
+/// Whether a kept page is skipped whole: its bytes are the ones last read
+/// (`equal`), no slot on it is walked each time (`walk`), and the oldest
+/// stamp of its slots left to tables (`oldest`, 0: none) has not run out.
+fn page_skips(equal: bool, walk: bool, oldest: u32, now: u32) -> bool {
+    equal && !walk && (oldest == 0 || stamp_lately(oldest, now))
+}
+
+/// The first and last bytes that differ between two copies of a page, as a
+/// range whose end is exclusive: `None` when they are the same
+/// (naixue2233, fxceless PR 783, `c6060592`).
+fn difference(old: &[u8], now: &[u8]) -> Option<(usize, usize)> {
+    if old.len() != now.len() {
+        return Some((0, now.len()));
+    }
+    let first = old.iter().zip(now).position(|(a, b)| a != b)?;
+    let last = old.iter().zip(now).rposition(|(a, b)| a != b)?;
+    Some((first, last + 1))
+}
+
+/// Whether the record at byte `at` of a page of `page_len` bytes, `len`
+/// long, lies within the page and outside `diff` (what differs from the
+/// copy last read; `None`: nothing does).
+fn record_unchanged(at: usize, len: usize, page_len: usize, diff: Option<(usize, usize)>) -> bool {
+    at + len <= page_len && diff.is_none_or(|(first, end)| at + len <= first || at >= end)
+}
 
 /// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
 /// equal records give equal prints, and two different records the same
@@ -4509,5 +5034,198 @@ mod own_copy_tests {
         assert_eq!(own_bytes_if(true, 8, base, 2, 0, 32, 32, true), None);
         assert_eq!(own_bytes_if(true, 8, base, 2, 4, 0, 0, false), None);
         assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
+    }
+}
+
+#[cfg(test)]
+mod sync_skip_tests {
+    use super::*;
+
+    const STEP: u64 = 32;
+
+    /// A title heap page of `n` records, each holding bytes of its own (not
+    /// a view of ours: mirrored, they make nothing, but their fingerprints
+    /// are kept), and the slots that went with it.
+    fn page(n: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; n * STEP as usize];
+        for (i, record) in bytes.chunks_exact_mut(STEP as usize).enumerate() {
+            record[16..20].copy_from_slice(&(i as u32 + 1).to_le_bytes());
+        }
+        bytes
+    }
+
+    /// One pass of the skipping sync over `bytes`, as `super::sync_heaps`
+    /// makes it for a written page.
+    fn pass(heap: &HostHeap, bytes: &[u8], frame: u64, pass: u64, revisit: bool) -> Skipped {
+        let start = bytes.as_ptr() as u64;
+        heap.skip_begin((start, STEP), pass);
+        let mut due = Vec::new();
+        let slots = 0..(bytes.len() as u64 / STEP);
+        heap.mirror_copied_page_skip(slots, (start, STEP), start as usize, bytes, |_, _| false, frame, revisit, &mut due)
+    }
+
+    #[test]
+    fn differences_and_records_inside_them() {
+        let a = [0u8; 64];
+        let mut b = a;
+        assert_eq!(difference(&a, &b), None);
+        b[33] = 1;
+        b[40] = 1;
+        assert_eq!(difference(&a, &b), Some((33, 41)));
+        assert_eq!(difference(&a, &b[..32]), Some((0, 32)));
+        // Records of 32 bytes: the second holds the change.
+        assert!(record_unchanged(0, 32, 64, Some((33, 41))));
+        assert!(!record_unchanged(32, 32, 64, Some((33, 41))));
+        assert!(record_unchanged(32, 32, 64, None));
+        // Past the page's end: never taken as unchanged.
+        assert!(!record_unchanged(48, 32, 64, None));
+        // Ends are exclusive.
+        assert!(record_unchanged(0, 32, 96, Some((32, 33))));
+        assert!(record_unchanged(64, 32, 96, Some((32, 64))));
+    }
+
+    #[test]
+    fn held_slots_and_their_stamps() {
+        let now = 1000;
+        assert_eq!(held_unchanged(HELD_SETTLED, now), Unchanged::Settled);
+        assert_eq!(held_unchanged(HELD_WALK, now), Unchanged::Walk);
+        assert_eq!(held_unchanged(now - TABLED_FRAMES as u32, now), Unchanged::Deferred);
+        assert_eq!(held_unchanged(now - TABLED_FRAMES as u32 - 1, now), Unchanged::Walk);
+        // As `tabled_lately` reads stamps: the same frames count.
+        assert!(stamp_lately(now, now) && !stamp_lately(0, now));
+        assert_eq!(deferred_stamp(0), HELD_WALK);
+        assert_eq!(deferred_stamp(7 | TABLED_READ), 7);
+        assert_eq!(older_stamp(0, 5, now), 5);
+        assert_eq!(older_stamp(5, 0, now), 5);
+        assert_eq!(older_stamp(900, 950, now), 900);
+        // Across the wrap of the stamps.
+        assert_eq!(older_stamp(u32::MAX >> 1, 3, 10), u32::MAX >> 1);
+        assert!(page_skips(true, false, 0, now));
+        assert!(page_skips(true, false, 990, now));
+        assert!(!page_skips(true, false, now - TABLED_FRAMES as u32 - 1, now));
+        assert!(!page_skips(true, true, 0, now));
+        assert!(!page_skips(false, false, 0, now));
+    }
+
+    #[test]
+    fn unchanged_pages_and_records_are_left_unread() {
+        let Some(heap) = HostHeap::new(false, 64) else {
+            return;
+        };
+        let mut bytes = page(64);
+        let first = pass(&heap, &bytes, 10, 1, false);
+        assert_eq!((first.looked, first.mirrored, first.page_skipped), (64, 64, false));
+        // The same bytes: the page is not walked.
+        let again = pass(&heap, &bytes, 10, 2, false);
+        assert_eq!((again.looked, again.page_skipped), (0, true));
+        // One record changed: only it is read.
+        bytes[5 * 32 + 20] ^= 0xff;
+        let one = pass(&heap, &bytes, 11, 3, false);
+        assert_eq!((one.looked, one.mirrored, one.unchanged), (1, 1, 63));
+        // A slot whose fingerprint was forgotten (its host slot changed
+        // with no change of the title's bytes) is walked again, and its
+        // page is not skipped.
+        heap.forget_copied(7);
+        let forgotten = pass(&heap, &bytes, 11, 4, false);
+        assert_eq!((forgotten.page_skipped, forgotten.looked, forgotten.mirrored), (false, 1, 1));
+        assert!(pass(&heap, &bytes, 11, 5, false).page_skipped);
+    }
+
+    /// A slot left to a table is not read again while its stamp lasts and
+    /// its bytes stay; once the stamp runs out it is mirrored, on its
+    /// page's next write or, unwritten, by a revisit.
+    #[test]
+    fn a_slot_left_to_a_table_is_mirrored_once_its_table_lapses() {
+        let Some(heap) = HostHeap::new(false, 16) else {
+            return;
+        };
+        if !tabled_out() || sync_tables() {
+            return;
+        }
+        let mut bytes = page(16);
+        heap.tabled_in(3, false, 100);
+        let first = pass(&heap, &bytes, 100, 1, false);
+        assert_eq!((first.looked, first.mirrored), (16, 15));
+        // Still a table's: the whole page is skipped.
+        assert!(pass(&heap, &bytes, 101, 2, false).page_skipped);
+        // Another record changes: slot 3 is left unread as a table's.
+        bytes[9 * 32 + 16] ^= 1;
+        let other = pass(&heap, &bytes, 102, 3, false);
+        assert_eq!((other.looked, other.mirrored, other.deferred, other.unchanged), (1, 1, 1, 14));
+        // The table lapses: slot 3 is walked and mirrored, the page written.
+        let late = 100 + TABLED_FRAMES + 2;
+        let lapsed = pass(&heap, &bytes, late, 4, false);
+        assert_eq!((lapsed.page_skipped, lapsed.looked, lapsed.mirrored), (false, 1, 1));
+        assert!(pass(&heap, &bytes, late, 5, false).page_skipped);
+
+        // Unwritten: the page comes back once a frame for it.
+        let Some(heap) = HostHeap::new(false, 16) else {
+            return;
+        };
+        heap.tabled_in(3, false, 100);
+        assert_eq!(pass(&heap, &bytes, 100, 1, false).mirrored, 15);
+        heap.skip_begin((bytes.as_ptr() as u64, STEP), 2);
+        assert!(heap.skip_revisits(101).is_empty(), "the table has not lapsed");
+        let revisits = heap.skip_revisits(late);
+        assert_eq!(revisits, vec![(bytes.as_ptr() as usize, bytes.len())]);
+        assert!(heap.skip_revisits(late).is_empty(), "once a frame");
+        let revisit = pass(&heap, &bytes, late, 2, true);
+        assert_eq!((revisit.looked, revisit.mirrored, revisit.unchanged), (1, 1, 15));
+        // A revisit of a page whose bytes changed leaves it to its write.
+        heap.tabled_in(4, false, late);
+        bytes[11 * 32 + 16] ^= 1;
+        let changed = pass(&heap, &bytes, late, 3, true);
+        assert_eq!(changed, Skipped::default());
+    }
+
+    /// The skipping walk leaves every slot's fingerprint and made view as
+    /// the full walk does, over a run of writes, forgets and tables.
+    #[test]
+    fn skipping_leaves_the_slots_as_the_full_walk_does() {
+        let (Some(full), Some(skipping)) = (HostHeap::new(false, 128), HostHeap::new(false, 128)) else {
+            return;
+        };
+        let mut bytes = page(128);
+        let start = bytes.as_ptr() as u64;
+        let mut seed = 0x1234_5678_u64;
+        let mut next = move |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let mut frame = 50u64;
+        // Pages skipped whole, records left as settled, as a table's.
+        let mut left = [0u64; 3];
+        for step in 1..400u64 {
+            for _ in 0..next(4) {
+                let slot = next(128) as usize;
+                match next(3) {
+                    0 => bytes[slot * 32..slot * 32 + 32].fill(0),
+                    _ => bytes[slot * 32 + 16 + next(16) as usize] ^= 1 + next(255) as u8,
+                }
+            }
+            if next(5) == 0 {
+                let slot = next(128) as u32;
+                full.forget_copied(slot);
+                skipping.forget_copied(slot);
+            }
+            if next(3) == 0 {
+                let slot = next(128) as u32;
+                let read = next(2) == 0;
+                full.tabled_in(slot, read, frame);
+                skipping.tabled_in(slot, read, frame);
+            }
+            frame += [0, 1, 1, 30, TABLED_FRAMES][next(5) as usize];
+            let slots = 0..128u64;
+            let _ = full.mirror_copied_page_at(slots, (start, STEP), start as usize, &bytes, |_, _| false, frame);
+            let got = pass(&skipping, &bytes, frame, step, false);
+            left[0] += u64::from(got.page_skipped);
+            left[1] += got.unchanged;
+            left[2] += got.deferred;
+            let copied = |h: &HostHeap| h.copied.lock().unwrap().clone();
+            let made = |h: &HostHeap| h.made.lock().unwrap().clone();
+            assert_eq!(copied(&full), copied(&skipping), "fingerprints after step {step}");
+            assert_eq!(made(&full), made(&skipping), "made slots after step {step}");
+        }
+        assert!(left.iter().all(|&n| n > 0), "every kind of skip was made: {left:?}");
     }
 }

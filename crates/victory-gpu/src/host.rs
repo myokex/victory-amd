@@ -7966,6 +7966,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        crate::watch::presented();
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -8071,6 +8072,46 @@ impl Meter {
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
                      is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+                );
+            }
+            let c: Vec<f64> = crate::watch::COSTS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            tracing::info!(
+                "askings of the write watch per frame, all threads: {:.2} ms waiting for the journal's lock ({:.0} waits), {:.2} ms \
+                 for the guards' lock ({:.0} waits), {:.2} ms for an asking of overlapping memory ({:.0} waits); {:.0} askings of the \
+                 kernel {:.2} ms, {:.0} of them refused; the guards {:.2} ms",
+                c[0] / 1000.0, c[1], c[2] / 1000.0, c[3], c[20] / 1000.0, c[21], c[4], c[5] / 1000.0, c[6], c[7] / 1000.0
+            );
+            tracing::info!(
+                "the guards per frame: {:.0} passes, {:.0} of them all clean; {:.0} blocks looked at; {:.0} questions to Windows \
+                 {:.2} ms; {:.0} runs made read-only {:.2} ms; the title's threads: {:.0} writes that faulted, waiting {:.2} ms \
+                 ({:.0} waits), where they map, read or write {:.2} ms ({:.0} waits)",
+                c[8], c[9], c[10], c[12], c[11] / 1e6, c[14], c[13] / 1000.0, c[19], c[15] / 1000.0, c[16], c[17] / 1000.0, c[18]
+            );
+            if c[22..].iter().any(|&n| n > 0.0) {
+                tracing::info!(
+                    "the guards' switches per frame: {:.0} questions to Windows not asked and {:.0} protections not asked over holes (VICTORY_HOLES_KEEP); {:.0} VirtualProtect calls saved opening runs, {:.0} runs refused whole (VICTORY_OPEN_RUNS); {:.0} clean blocks made due (VICTORY_VIEW_RECHECK)",
+                    c[22], c[26], c[23], c[24], c[25]
+                );
+            }
+            let w = [0, 1, 2, 3, 4].map(|i| {
+                let [n, bytes, us, up] =
+                    [0, 1, 2, 3].map(|k| crate::texture::REREAD[i][k].swap(0, Ordering::Relaxed) as f64 / frames);
+                format!("{n:.1} ({up:.1} given again) {:.1} MB {:.1} ms", bytes / 1e6, us / 1000.0)
+            });
+            tracing::info!(
+                "textures read again per frame, why: the write watch {}; the guards {}; their turn to be hashed {}; movies and \
+                 unseen writes {}; pages missing {}",
+                w[0], w[1], w[2], w[3], w[4]
+            );
+            let s = crate::texture::SKIPS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+            if s.iter().any(|&n| n > 0.0) {
+                tracing::info!(
+                    "texture refreshes spared per frame: {:.1} write-watch askings of view memory not made \
+                     (VICTORY_TEXTURE_SKIP_FAILED_ASK=1); partly mapped (VICTORY_TEXTURE_MISSING_WAIT=1): {:.1} not read, \
+                     nothing mapped or written since; {:.1} signs held for later; {:.1} read by the fallback with no sign; \
+                     {:.1} read and not detiled, held levels as before; {:.1} read and not detiled, all bytes as before; \
+                     {:.1} the guards say nothing of, read on the old timer",
+                    s[0], s[1], s[2], s[3], s[4], s[5], s[6]
                 );
             }
             let [through, left, first] = [0, 1, 2].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);

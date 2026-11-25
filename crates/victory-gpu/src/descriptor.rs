@@ -188,6 +188,17 @@ pub(crate) fn sync_heaps() {
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
     let mut straddle = [0u8; 32];
+    // `VICTORY_SYNC_SKIP=1` (`host::HostHeap::mirror_copied_page_skip`):
+    // pages and records found as they were are left unread. Off: as before.
+    let skip = host::sync_skip();
+    let frame = crate::frame::current();
+    static PASS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let pass = if skip { PASS.fetch_add(1, Relaxed) + 1 } else { 0 };
+    // The records to mirror, one list for every page (UwUCammie, fxceless
+    // PR 1043). Pages skipped whole, records left unread as settled and as
+    // a table's, pages revisited ([`host::SKIP_COUNTS`]).
+    let mut due: Vec<host::Due> = Vec::new();
+    let mut skipped = [0u64; 4];
     // Alone: a look-up of a recording thread that mirrors a record (read under
     // the list's shared side) never comes between this pass's read of a page
     // and what it makes of it, or the older bytes would be made last.
@@ -204,6 +215,13 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        if skip {
+            host.skip_begin((start, step), pass);
+        }
+        // A record straddling a 64 KiB page boundary, read whole through
+        // the kernel (`VICTORY_SYNC_SKIP=1`).
+        let straddling =
+            |handle: u64, into: &mut [u8; 32]| handle + step <= end && crate::host::read_into(handle as *const u8, &mut into[..step as usize]);
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
@@ -216,6 +234,25 @@ pub(crate) fn sync_heaps() {
                 if crate::host::read_into(from as *const u8, &mut page_bytes) {
                     pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                    if skip {
+                        let got = host.mirror_copied_page_skip(
+                            slots,
+                            (start, step),
+                            from,
+                            &page_bytes,
+                            straddling,
+                            frame,
+                            false,
+                            &mut due,
+                        );
+                        looked += got.looked;
+                        mirrored += got.mirrored;
+                        skipped[0] += u64::from(got.page_skipped);
+                        skipped[1] += got.unchanged;
+                        skipped[2] += got.deferred;
+                        page += crate::watch::PAGE;
+                        continue;
+                    }
                     // The page's records in one go, under one lock of the
                     // fingerprints and one of the made slots
                     // (`HostHeap::mirror_copied_page`).
@@ -263,8 +300,32 @@ pub(crate) fn sync_heaps() {
                 page += crate::watch::PAGE;
             }
         }
+        // Once a frame: kept pages not written since whose slots left to
+        // tables may have run out of their table stamp; those slots are
+        // mirrored now rather than at the page's next write.
+        if skip {
+            for (from, len) in host.skip_revisits(frame) {
+                page_bytes.resize(len, 0);
+                if !crate::host::read_into(from as *const u8, &mut page_bytes) {
+                    continue;
+                }
+                let slots = changed_slots(from, from + len, start as usize, step, mirrored_count);
+                let got =
+                    host.mirror_copied_page_skip(slots, (start, step), from, &page_bytes, straddling, frame, true, &mut due);
+                looked += got.looked;
+                mirrored += got.mirrored;
+                skipped[1] += got.unchanged;
+                skipped[2] += got.deferred;
+                skipped[3] += 1;
+            }
+        }
     }
     drop(heaps);
+    if skip {
+        for (count, n) in host::SKIP_COUNTS.iter().zip(skipped) {
+            count.fetch_add(n, Relaxed);
+        }
+    }
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
     }
@@ -293,6 +354,23 @@ pub(crate) fn sync_line(frames: f64) {
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
         micros as f64 / 1000.0 / frames
     );
+    if host::sync_skip() {
+        let [whole, unchanged, deferred, revisited, forgotten] =
+            [0, 1, 2, 3, 4].map(|i| host::SKIP_COUNTS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+        tracing::info!(
+            "descriptor records found as they were and left unread (VICTORY_SYNC_SKIP=1), per frame: {:.1} heap pages \
+             skipped whole, {:.0} records unchanged and mirrored as they are, {:.0} unchanged and still left to the \
+             tables, {:.1} pages revisited for tables that ran out, {:.1} slots forgotten and walked again; {:.1} MB of \
+             pages kept; sync {:.2} ms",
+            whole as f64 / frames,
+            unchanged as f64 / frames,
+            deferred as f64 / frames,
+            revisited as f64 / frames,
+            forgotten as f64 / frames,
+            host::SKIP_KEPT.load(std::sync::atomic::Ordering::Relaxed) as f64 / (1 << 20) as f64,
+            micros as f64 / 1000.0 / frames
+        );
+    }
     let left = host::BUFFERS_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed);
     if left > 0 {
         tracing::info!(
