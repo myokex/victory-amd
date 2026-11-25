@@ -4313,6 +4313,18 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Whether a read of another lane of this lane's quad goes through quad
+    /// reads, which reach helper lanes: in a pixel shader, unless
+    /// `VICTORY_PS_QUAD_READS=0`. At a triangle's edge the quad's other
+    /// pixels are helpers, and wave reads give 0 from them on AMD: a
+    /// derivative taken by hand (`quad_perm`, `ds_swizzle`) was the whole
+    /// value there.
+    fn helpers_read(&self, quad: bool) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        quad && self.s.pixel
+            && *ON.get_or_init(|| std::env::var_os("VICTORY_PS_QUAD_READS").is_none_or(|v| v != "0"))
+    }
+
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
     /// lane must be a constant.
     fn quad_pick(&mut self, x: V, src: V) -> V {
@@ -4457,7 +4469,7 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            let r = if mesh_quad || self.helpers_read(quad) {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -6769,7 +6781,7 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if mesh_quad || self.helpers_read(quad) {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
