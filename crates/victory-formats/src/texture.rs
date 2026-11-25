@@ -1051,7 +1051,7 @@ mod tests {
         let needs: Vec<u64> = (0..9).map(|mip| l.bytes_from(mip)).collect();
         assert!(needs.windows(2).all(|w| w[0] >= w[1]), "{needs:?}");
         assert_eq!((l.bytes_from(4), l.bytes_from(8)), (4096, 4096));
-        let tiled: Vec<u8> = (0..l.size).map(|i| (i * 7 >> 3) as u8).collect();
+        let tiled: Vec<u8> = (0..l.size).map(|i| ((i * 7) >> 3) as u8).collect();
         for mip in 1..9 {
             let m = l.mips[mip as usize];
             let pitch = m.width as usize * 8;
