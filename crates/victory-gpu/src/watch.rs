@@ -386,6 +386,8 @@ struct Guards {
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
     aliased: BTreeSet<usize>,
+    /// Block ranges of native file reads still writing to title memory.
+    pending: Vec<std::ops::Range<usize>>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -393,7 +395,14 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
+    pending: Vec::new(),
 });
+
+impl Guards {
+    fn pending(&self, block: usize) -> bool {
+        self.pending.iter().any(|range| range.contains(&block))
+    }
+}
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -458,7 +467,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
-            } else {
+            } else if !g.pending(block) {
                 run.get_or_insert(block);
                 continue;
             }
@@ -575,7 +584,7 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// its copies took them, `open` would have opened it.
 fn protect_alias(g: &mut Guards, block: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-    if g.protected.contains(&block) {
+    if g.protected.contains(&block) || g.pending(block) {
         return;
     }
     let mut old = 0;
@@ -684,6 +693,38 @@ pub fn writing(at: usize, len: usize) {
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
+}
+
+/// Keeps a synchronous file read's destination writable while the GPU refreshes its views.
+#[must_use = "keep the destination open until the file read has completed"]
+pub fn kernel_read_destination(at: usize, len: usize) -> impl Drop {
+    struct Destination {
+        at: usize,
+        len: usize,
+        blocks: std::ops::Range<usize>,
+    }
+
+    impl Drop for Destination {
+        fn drop(&mut self) {
+            let mut g = guards();
+            if let Some(i) = g.pending.iter().position(|range| *range == self.blocks) {
+                g.pending.swap_remove(i);
+            }
+            // Another view may have been copied while the read was still in flight.
+            open(&mut g, self.at, self.at.saturating_add(self.len));
+            drop(g);
+            crate::descriptor::host::remapped(self.at, self.len);
+        }
+    }
+
+    let end = at.saturating_add(len);
+    let blocks = at / BLOCK..end.div_ceil(BLOCK);
+    let mut g = guards();
+    open(&mut g, at, end);
+    g.pending.push(blocks.clone());
+    drop(g);
+    crate::descriptor::host::remapped(at, len);
+    Destination { at, len, blocks }
 }
 
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
@@ -1218,6 +1259,39 @@ mod tests {
         }
         // SAFETY: the section's last reference.
         unsafe { CloseHandle(section as *mut std::ffi::c_void) };
+    }
+
+    /// The GPU can refresh either view while overlapping file reads are in flight.
+    #[test]
+    fn pending_kernel_reads_survive_direct_and_aliased_refreshes() {
+        use std::io::Write;
+        use std::os::windows::fs::FileExt;
+
+        let (section, destination, alias) = two_views(BLOCK);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"ab").unwrap();
+        let read = |offset: usize| {
+            // SAFETY: one byte in the test's mapped destination.
+            let out = unsafe { std::slice::from_raw_parts_mut((destination + offset) as *mut u8, 1) };
+            file.seek_read(out, offset as u64)
+        };
+        assert!(guard(destination, destination + BLOCK).is_some());
+        {
+            let _first = crate::kernel_read_destination(destination, 2);
+            {
+                let _second = crate::kernel_read_destination(destination + 1, 1);
+                assert!(guard(alias, alias + BLOCK).is_some());
+                assert_eq!(read(0).expect("alias refresh must keep the destination writable"), 1);
+            }
+            assert!(guard(destination, destination + BLOCK).is_some());
+            assert_eq!(read(1).expect("the first overlapping read is still pending"), 1);
+        }
+        assert_eq!(guard(alias, alias + BLOCK), Some(vec![alias / PAGE]));
+        assert_eq!(guard(alias, alias + BLOCK), Some(Vec::new()));
+        // SAFETY: the same initialized section bytes, read through its second view.
+        assert_eq!(unsafe { std::slice::from_raw_parts(alias as *const u8, 2) }, b"ab");
+        assert!(!writable(destination), "the next GPU refresh guards it again");
+        drop_views(section, &[destination, alias], BLOCK);
     }
 
     /// The title wrote the pages of a guarded texture through another view
