@@ -62,6 +62,83 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Abstracts `ID3D12InfoQueue` drain/clear so creation serialization can be
+/// tested deterministically without requiring Windows Graphics Tools.
+trait InfoQueue {
+    fn drain_messages(&self) -> Vec<String>;
+    fn clear_messages(&self);
+}
+
+impl InfoQueue for ID3D12InfoQueue {
+    fn drain_messages(&self) -> Vec<String> {
+        let mut messages = Vec::new();
+        // SAFETY: each message is read into a buffer of the size the queue
+        // asks for, aligned for the message header.
+        unsafe {
+            for i in 0..self.GetNumStoredMessages() {
+                let mut len = 0usize;
+                let _ = self.GetMessage(i, None, &mut len);
+                if len < size_of::<D3D12_MESSAGE>() {
+                    continue;
+                }
+                let mut buffer = vec![0u64; len.div_ceil(8)];
+                let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if self.GetMessage(i, Some(message), &mut len).is_ok() {
+                    let m = &*message;
+                    if !m.pDescription.is_null() && m.DescriptionByteLength > 0 {
+                        let bytes = std::slice::from_raw_parts(
+                            m.pDescription,
+                            m.DescriptionByteLength.saturating_sub(1),
+                        );
+                        let text = String::from_utf8_lossy(bytes);
+                        let text = text.trim_end_matches('\0');
+                        if !text.is_empty() {
+                            messages.push(text.to_owned());
+                        }
+                    }
+                }
+            }
+            self.ClearStoredMessages();
+        }
+        messages
+    }
+
+    fn clear_messages(&self) {
+        // SAFETY: `ClearStoredMessages` requires only a valid queue pointer.
+        unsafe { self.ClearStoredMessages() };
+    }
+}
+
+/// Process-wide lock around `Create*` + `ID3D12InfoQueue` clear/drain because
+/// D3D12 devices and their info queues are shared across `Host` instances.
+static INFO_QUEUE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn create_with_queue_fmt<T, E>(
+    queue: Option<&dyn InfoQueue>,
+    create: impl FnOnce() -> Result<T, E>,
+    fmt_err: impl FnOnce(E) -> String,
+) -> Result<T, String> {
+    let Some(queue) = queue else {
+        return create().map_err(fmt_err);
+    };
+    let _guard = INFO_QUEUE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    queue.clear_messages();
+    match create() {
+        Ok(v) => {
+            queue.clear_messages();
+            Ok(v)
+        }
+        Err(e) => {
+            let mut text = fmt_err(e);
+            for msg in queue.drain_messages() {
+                text.push_str(" | ");
+                text.push_str(&msg);
+            }
+            Err(text)
+        }
+    }
+}
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
@@ -224,14 +301,30 @@ impl Host {
         unsafe {
             let mut blob = None;
             let mut error = None;
-            D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error))
-                .map_err(err)?;
+            if let Err(e) =
+                D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error))
+            {
+                let mut msg = err(e);
+                if let Some(error) = error {
+                    let bytes = std::slice::from_raw_parts(
+                        error.GetBufferPointer().cast::<u8>(),
+                        error.GetBufferSize(),
+                    );
+                    let detail = String::from_utf8_lossy(bytes);
+                    let detail = detail.trim_end_matches(['\0', '\r', '\n']);
+                    if !detail.is_empty() {
+                        msg.push_str(" | ");
+                        msg.push_str(detail);
+                    }
+                }
+                return Err(msg);
+            }
             let blob: ID3DBlob = blob.ok_or("no root signature blob")?;
             let bytes = std::slice::from_raw_parts(
                 blob.GetBufferPointer().cast::<u8>(),
                 blob.GetBufferSize(),
             );
-            self.device.CreateRootSignature(0, bytes).map_err(err)
+            self.create_checked(|| self.device.CreateRootSignature(0, bytes))
         }
     }
 
@@ -260,34 +353,18 @@ impl Host {
             ..Default::default()
         };
         // SAFETY: the description points at live data.
-        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(|e| self.explained(e))
+        self.create_checked(|| unsafe { self.device.CreateComputePipelineState(&desc) })
     }
 
-    /// The error with the debug layer's messages since the last call, if
-    /// the layer is on (`VICTORY_D3D12_DEBUG`).
-    fn explained(&self, e: windows::core::Error) -> String {
-        let mut text = err(e);
-        let Ok(queue) = self.device.cast::<ID3D12InfoQueue>() else {
-            return text;
-        };
-        // SAFETY: each message is read into a buffer of the size the queue
-        // asks for, aligned for the message header.
-        unsafe {
-            for i in 0..queue.GetNumStoredMessages() {
-                let mut len = 0usize;
-                let _ = queue.GetMessage(i, None, &mut len);
-                let mut buffer = vec![0u64; len.div_ceil(8)];
-                let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
-                if queue.GetMessage(i, Some(message), &mut len).is_ok() {
-                    let m = &*message;
-                    let bytes = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength.saturating_sub(1));
-                    text.push_str(" | ");
-                    text.push_str(&String::from_utf8_lossy(bytes));
-                }
-            }
-            queue.ClearStoredMessages();
-        }
-        text
+    /// Runs a D3D12 creation call, serializing against the shared
+    /// `ID3D12InfoQueue` (if `VICTORY_D3D12_DEBUG` enabled one) so stale
+    /// messages are cleared on `Ok` and errors include all debug-layer reasons.
+    fn create_checked<T>(
+        &self,
+        create: impl FnOnce() -> windows::core::Result<T>,
+    ) -> Result<T, String> {
+        let queue = self.device.cast::<ID3D12InfoQueue>().ok();
+        create_with_queue_fmt(queue.as_ref().map(|q| q as &dyn InfoQueue), create, err)
     }
 
     /// A graphics pipeline from a vertex and a pixel shader, with float or
@@ -394,8 +471,7 @@ impl Host {
             desc.DepthStencilState.StencilEnable = true.into();
         }
         // SAFETY: the description points at live data.
-        let pso = unsafe { self.device.CreateGraphicsPipelineState(&desc) };
-        pso.map_err(err)
+        self.create_checked(|| unsafe { self.device.CreateGraphicsPipelineState(&desc) })
     }
 
     /// A mesh pipeline from a mesh and a pixel shader (user data of the mesh
@@ -505,7 +581,7 @@ impl Host {
         };
         let device: ID3D12Device2 = self.device.cast().map_err(err)?;
         // SAFETY: the stream points at live data and outlives the call.
-        unsafe { device.CreatePipelineState(&desc) }.map_err(err)
+        self.create_checked(|| unsafe { device.CreatePipelineState(&desc) })
     }
 }
 
@@ -1449,5 +1525,225 @@ impl Host {
             drop(keep);
             Ok(out)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Barrier, Mutex, OnceLock};
+
+    use super::*;
+
+    fn test_host() -> Option<&'static Host> {
+        static HOST: OnceLock<Option<Host>> = OnceLock::new();
+        HOST.get_or_init(|| Host::new(false).ok()).as_ref()
+    }
+
+    #[derive(Default)]
+    struct FakeInfoQueue {
+        messages: Mutex<Vec<String>>,
+        in_create: AtomicBool,
+        overlaps: AtomicUsize,
+    }
+
+    impl FakeInfoQueue {
+        fn push(&self, msg: impl Into<String>) {
+            self.messages.lock().unwrap().push(msg.into());
+        }
+
+        fn snapshot(&self) -> Vec<String> {
+            self.messages.lock().unwrap().clone()
+        }
+
+        fn enter_create(&self) {
+            if self.in_create.swap(true, Ordering::SeqCst) {
+                self.overlaps.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn leave_create(&self) {
+            self.in_create.store(false, Ordering::SeqCst);
+        }
+    }
+
+    impl InfoQueue for FakeInfoQueue {
+        fn drain_messages(&self) -> Vec<String> {
+            std::mem::take(&mut *self.messages.lock().unwrap())
+        }
+
+        fn clear_messages(&self) {
+            self.messages.lock().unwrap().clear();
+        }
+    }
+
+    #[test]
+    fn info_queue_clears_stale_messages_on_ok() {
+        let q = FakeInfoQueue::default();
+        q.push("stale warning before call");
+        let res = create_with_queue_fmt(
+            Some(&q),
+            || {
+                q.push("warning emitted on ok");
+                Ok::<_, &str>(7u32)
+            },
+            str::to_owned,
+        );
+        assert_eq!(res, Ok(7));
+        assert!(q.snapshot().is_empty());
+    }
+
+    #[test]
+    fn info_queue_drains_only_current_call_messages_on_err() {
+        let q = FakeInfoQueue::default();
+        q.push("stale message from earlier op");
+        let res = create_with_queue_fmt(
+            Some(&q),
+            || {
+                q.push("first reason");
+                q.push("second reason");
+                Err::<(), _>("E_INVALIDARG")
+            },
+            str::to_owned,
+        );
+        assert_eq!(
+            res.unwrap_err(),
+            "E_INVALIDARG | first reason | second reason"
+        );
+        assert!(q.snapshot().is_empty());
+    }
+
+    #[test]
+    fn info_queue_serializes_concurrent_workers_without_mixing_or_dropping() {
+        let q = FakeInfoQueue::default();
+        std::thread::scope(|s| {
+            for tid in 0..8 {
+                let q = &q;
+                s.spawn(move || {
+                    for iter in 0..40 {
+                        let fail = (tid + iter) % 2 == 0;
+                        let res = create_with_queue_fmt(
+                            Some(q),
+                            || {
+                                q.enter_create();
+                                std::thread::yield_now();
+                                let out = if fail {
+                                    q.push(format!("worker-{tid}-iter-{iter}"));
+                                    Err("fail")
+                                } else {
+                                    q.push(format!("ok-warning-{tid}-{iter}"));
+                                    Ok(())
+                                };
+                                q.leave_create();
+                                out
+                            },
+                            str::to_owned,
+                        );
+                        if fail {
+                            assert_eq!(
+                                res.unwrap_err(),
+                                format!("fail | worker-{tid}-iter-{iter}")
+                            );
+                        } else {
+                            assert_eq!(res, Ok(()));
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(q.overlaps.load(Ordering::SeqCst), 0);
+        assert!(q.snapshot().is_empty());
+    }
+
+    #[test]
+    fn absent_info_queue_does_not_serialize() {
+        let barrier = Barrier::new(2);
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                let barrier = &barrier;
+                s.spawn(move || {
+                    let res = create_with_queue_fmt(
+                        None,
+                        || {
+                            barrier.wait();
+                            Ok::<_, &str>(())
+                        },
+                        str::to_owned,
+                    );
+                    assert_eq!(res, Ok(()));
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn refused_root_signature_and_pipelines_report_errors() {
+        let Some(host) = test_host() else {
+            eprintln!("no SM 6.6 device; skipped");
+            return;
+        };
+        let has_queue = host.device.cast::<ID3D12InfoQueue>().is_ok();
+        let ps = stub_ps();
+        let vs = stub_vs(&ps).expect("stub_vs");
+        let root = host.root_signature(&vs, &ps).expect("valid root signature");
+
+        let mut too_many = stub_ps();
+        too_many.root_cbvs = (0..33).collect();
+        let root_ser_err = host
+            .root_signature_for(&[(&too_many, D3D12_SHADER_VISIBILITY_ALL)])
+            .unwrap_err();
+        assert!(!root_ser_err.is_empty());
+
+        let bad_root_err = host
+            .create_checked(|| unsafe {
+                host.device
+                    .CreateRootSignature::<ID3D12RootSignature>(0, &[0u8; 16])
+            })
+            .unwrap_err();
+        assert!(!bad_root_err.is_empty());
+
+        let cs_err = host.compute_pipeline_with(&root, &[0u8; 16]).unwrap_err();
+        assert!(!cs_err.is_empty());
+
+        let gfx_vs_err = host
+            .pipeline_with_gs(&root, &ps.dxil, None, &ps.dxil)
+            .unwrap_err();
+        assert!(!gfx_vs_err.is_empty());
+
+        let gfx_gs_err = host
+            .pipeline_with_gs(&root, &vs.dxil, Some(&[0u8; 16]), &ps.dxil)
+            .unwrap_err();
+        assert!(!gfx_gs_err.is_empty());
+
+        let ms_err = host
+            .mesh_pipeline_with(&root, &[0u8; 16], &ps.dxil)
+            .unwrap_err();
+        assert!(!ms_err.is_empty());
+
+        if has_queue {
+            for e in [&bad_root_err, &cs_err, &gfx_vs_err, &gfx_gs_err, &ms_err] {
+                assert!(
+                    e.contains(" | "),
+                    "expected D3D12 debug-layer reason in error: {e}"
+                );
+            }
+        }
+
+        // Concurrent valid + refused pipeline/root-signature creation on the
+        // shared device must remain consistent across worker threads.
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    let ok_pso = host.pipeline_with(&root, &vs.dxil, &ps.dxil);
+                    assert!(ok_pso.is_ok(), "valid pipeline failed: {ok_pso:?}");
+                    assert!(host.compute_pipeline_with(&root, &[0u8; 16]).is_err());
+                    assert!(
+                        host.pipeline_with_gs(&root, &vs.dxil, Some(&[0u8; 16]), &ps.dxil)
+                            .is_err()
+                    );
+                    assert!(host.mesh_pipeline_with(&root, &[0u8; 16], &ps.dxil).is_err());
+                });
+            }
+        });
     }
 }
