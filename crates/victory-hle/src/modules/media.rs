@@ -53,6 +53,19 @@ fn local(url: &[u16]) -> Result<Vec<u16>, (String, String)> {
             return Err(("unc".into(), host_of(rest.trim_start_matches("UNC\\"))));
         }
         text.clone()
+    } else if let Some(rest) = text.strip_prefix(r"\??\") {
+        if rest
+            .as_bytes()
+            .get(..4)
+            .is_some_and(|p| p.eq_ignore_ascii_case(b"UNC\\"))
+        {
+            return Err(("unc".into(), host_of(&rest[4..])));
+        }
+        if !drive(rest) {
+            return Ok(with_nul(url));
+        }
+        let wide: Vec<u16> = format!(r"\\?\{rest}").encode_utf16().collect();
+        return Ok(files::translate(&wide).unwrap_or_else(|| with_nul(url)));
     } else if let Some(rest) = text.strip_prefix(r"\\").or_else(|| text.strip_prefix("//")) {
         return Err(("unc".into(), host_of(rest)));
     } else if drive(&text) {
@@ -490,12 +503,16 @@ mod tests {
             ("unc".into(), "server".into())
         );
         assert_eq!(
+            refused(r"\??\UNC\server\share\a.mp4"),
+            ("unc".into(), "server".into())
+        );
+        assert_eq!(
             refused("file://server/share/a.mp4"),
             ("file".into(), "server".into())
         );
 
         // A path on a virtual drive goes to its host folder, also as a
-        // `file:` URL; other local files pass as they are.
+        // `file:` URL or NT `\??\<drive>` path; other local files pass as they are.
         // Checked by opening the files: `files` may spell the host root
         // differently (absolute, `\\?\` for long paths) from the temp dir.
         let dir = tempfile::tempdir().unwrap();
@@ -509,12 +526,22 @@ mod tests {
             Some(&b"1"[..]),
             "{host}"
         );
+        let from_nt = text(&local(&wide(&format!(r"\??\{letter}:\movies\intro.mp4"))).unwrap());
+        assert_eq!(
+            std::fs::read(&from_nt).ok().as_deref(),
+            Some(&b"1"[..]),
+            "{from_nt}"
+        );
         let from_url =
             text(&local(&wide(&format!("file:///{letter}:/movies/intro%20a.mp4"))).unwrap());
         assert_eq!(
             std::fs::read(&from_url).ok().as_deref(),
             Some(&b"2"[..]),
             "{from_url}"
+        );
+        assert_eq!(
+            text(&local(&wide(r"\??\C:\Windows\a.wav")).unwrap()),
+            r"\??\C:\Windows\a.wav"
         );
         assert_eq!(
             text(&local(&wide("file:///C:/Windows/a.wav")).unwrap()),
