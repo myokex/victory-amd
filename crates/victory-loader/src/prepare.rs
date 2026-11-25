@@ -131,27 +131,33 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
     let Some(start) = info.rva_to_file_offset(rva).filter(|_| size != 0) else {
         return out;
     };
-    let (mut at, end) = (start as usize, start as usize + size as usize);
-    while at + 8 <= end {
+    let mut at = start as usize;
+    let end = at.saturating_add(size as usize).min(bytes.len());
+    while let Some(entries_start) = at.checked_add(8).filter(|&h| h <= end) {
         let (Some(page), Some(block)) =
             (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
         else {
             break;
         };
         let block = block as usize;
-        if block < 8 || at + block > end {
+        let Some(block_end) = at
+            .checked_add(block)
+            .filter(|&next| block >= 8 && next <= end)
+        else {
             break;
-        }
-        for entry in (at + 8..at + block).step_by(2) {
+        };
+        for entry in (entries_start..block_end).step_by(2) {
             let Some(e) = bytes.get(entry..entry + 2) else {
                 break;
             };
             let e = u16::from_le_bytes([e[0], e[1]]);
-            if e >> 12 == DIR64 {
-                out.push((entry, page + u32::from(e & 0xFFF)));
+            if e >> 12 == DIR64
+                && let Some(target) = page.checked_add(u32::from(e & 0xFFF))
+            {
+                out.push((entry, target));
             }
         }
-        at += block;
+        at = block_end;
     }
     out
 }
@@ -279,5 +285,68 @@ mod tests {
         let a = prepare(&original).unwrap();
         let b = prepare(&original).unwrap();
         assert_eq!(a.file_name(), b.file_name());
+    }
+
+    /// Minimal PE32+ image with one `.reloc` section at RVA `0x1000` (raw
+    /// offset `0x200`) and `BASERELOC` directory pointing at it.
+    fn synthetic_reloc_image(reloc_dir_size: u32, reloc_bytes: &[u8]) -> Vec<u8> {
+        let mut d = vec![0u8; 0x200];
+        d[0..2].copy_from_slice(b"MZ");
+        d[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        d[0x40..0x44].copy_from_slice(b"PE\0\0");
+        d[0x44..0x46].copy_from_slice(&victory_pe::MACHINE_AMD64.to_le_bytes());
+        d[0x46..0x48].copy_from_slice(&1u16.to_le_bytes()); // sections
+        d[0x54..0x56].copy_from_slice(&240u16.to_le_bytes()); // optional header size
+        d[0x56..0x58].copy_from_slice(&0x2022u16.to_le_bytes()); // DLL, large address aware
+        let opt = 0x58;
+        d[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        d[opt + 24..opt + 32].copy_from_slice(&0x1_8000_0000u64.to_le_bytes());
+        d[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+        d[opt + 36..opt + 40].copy_from_slice(&0x200u32.to_le_bytes());
+        d[opt + 56..opt + 60].copy_from_slice(&0x2000u32.to_le_bytes());
+        d[opt + 60..opt + 64].copy_from_slice(&0x200u32.to_le_bytes());
+        d[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+        let basereloc_dd = opt + 112 + dir::BASERELOC * 8;
+        d[basereloc_dd..basereloc_dd + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        d[basereloc_dd + 4..basereloc_dd + 8].copy_from_slice(&reloc_dir_size.to_le_bytes());
+        let sec = opt + 240;
+        d[sec..sec + 6].copy_from_slice(b".reloc");
+        d[sec + 8..sec + 12].copy_from_slice(&0x200u32.to_le_bytes()); // virtual size
+        d[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        d[sec + 16..sec + 20].copy_from_slice(&0x200u32.to_le_bytes()); // raw size
+        d[sec + 20..sec + 24].copy_from_slice(&0x200u32.to_le_bytes()); // raw offset
+        d.extend_from_slice(reloc_bytes);
+        d.resize(0x400, 0);
+        d
+    }
+
+    #[test]
+    fn dir64_relocations_clamps_oversized_directory_and_skips_overflows() {
+        // Block 1 (12 bytes): page = 0xFFFF_F800, two DIR64 entries:
+        //   +0x100 -> 0xFFFF_F900 (valid)
+        //   +0x900 -> overflows u32::MAX (must be skipped without panicking)
+        // Block 2 (8-byte header): block size = u32::MAX (must break cleanly).
+        let mut relocs = Vec::new();
+        relocs.extend_from_slice(&0xFFFF_F800u32.to_le_bytes());
+        relocs.extend_from_slice(&12u32.to_le_bytes());
+        relocs.extend_from_slice(&((10u16 << 12) | 0x100).to_le_bytes());
+        relocs.extend_from_slice(&((10u16 << 12) | 0x900).to_le_bytes());
+        relocs.extend_from_slice(&0x1000u32.to_le_bytes());
+        relocs.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let bytes = synthetic_reloc_image(u32::MAX, &relocs);
+        let info = ImageInfo::parse(&bytes).unwrap();
+        assert_eq!(dir64_relocations(&bytes, &info), vec![(0x208, 0xFFFF_F900)]);
+
+        // Also verify a small valid block followed by an oversized block size
+        // exceeding a clamped directory size stops without reading out of bounds.
+        let mut exact = Vec::new();
+        exact.extend_from_slice(&0x2000u32.to_le_bytes());
+        exact.extend_from_slice(&12u32.to_le_bytes());
+        exact.extend_from_slice(&((10u16 << 12) | 0x020).to_le_bytes());
+        exact.extend_from_slice(&0u16.to_le_bytes()); // IMAGE_REL_BASED_ABSOLUTE padding
+        let bytes = synthetic_reloc_image(12, &exact);
+        let info = ImageInfo::parse(&bytes).unwrap();
+        assert_eq!(dir64_relocations(&bytes, &info), vec![(0x208, 0x2020)]);
     }
 }
