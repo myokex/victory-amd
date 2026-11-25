@@ -50,6 +50,31 @@ impl SigElement {
         }
     }
 
+    fn semantic_name(&self) -> &str {
+        match self.kind {
+            1 => "SV_VertexID",
+            2 => "SV_InstanceID",
+            3 => "SV_Position",
+            4 => "SV_RenderTargetArrayIndex",
+            5 => "SV_ViewportArrayIndex",
+            6 => "SV_ClipDistance",
+            7 => "SV_CullDistance",
+            10 => "SV_PrimitiveID",
+            12 => "SV_SampleIndex",
+            13 => "SV_IsFrontFace",
+            14 => "SV_Coverage",
+            15 => "SV_InnerCoverage",
+            16 => "SV_Target",
+            17 => "SV_Depth",
+            18 => "SV_DepthLessEqual",
+            19 => "SV_DepthGreaterEqual",
+            20 => "SV_StencilRef",
+            28 => "SV_Barycentrics",
+            30 => "SV_CullPrimitive",
+            _ => &self.name,
+        }
+    }
+
     fn sig_comp(&self) -> u32 {
         match self.comp {
             1 | 5 => 1, // bool and u32
@@ -60,7 +85,8 @@ impl SigElement {
     }
 
     fn mask(&self) -> u8 {
-        ((1u8 << self.cols) - 1) << self.col
+        let col = if self.row.is_some() { self.col } else { 0 };
+        ((1u8 << self.cols) - 1) << col
     }
 }
 
@@ -71,8 +97,9 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     out.extend(8u32.to_le_bytes());
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
-    // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last).
+    // the semantic's canonical string, which is one static string per system
+    // value); the rows sorted by register (unallocated last), breaking ties
+    // by semantic-name offset (`DxilContainerAssembler`'s `sort_sig`).
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -83,17 +110,22 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         match shared {
             Some(j) => offsets.push(offsets[j]),
             None => {
+                let name = e.semantic_name();
                 offsets.push(next);
-                next += e.name.len() as u32 + 1;
-                names.push(&e.name);
+                next += name.len() as u32 + 1;
+                names.push(name);
             }
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), offsets[i]));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
-        let used = e.usage << e.col;
+        let used = if e.row.is_some() {
+            e.usage << e.col
+        } else {
+            e.usage
+        };
         let rw = if input { used } else { !used & 0xf };
         for v in [
             0,
@@ -415,5 +447,75 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    /// DXC's `DxilProgramSignatureWriter` (`sort_sig`) orders elements sharing
+    /// a register by semantic-name offset rather than start column, writes
+    /// canonical system-value strings regardless of input casing, and leaves
+    /// unallocated elements' component and usage masks unshifted.
+    #[test]
+    fn signature_matches_dxc_row_order_and_canonical_system_names() {
+        let pos = SigElement {
+            name: "SV_POSITION".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 4,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0b0011,
+            half: false,
+        };
+        // Declared first in HLSL (`TEXCOORD0`, 1 float packed at `.w`), before
+        // `TEXCOORD1` (3 floats packed at `.xyz`) in the same register row.
+        let tc0 = SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(1),
+            col: 3,
+            cols: 1,
+            usage: 0b0001,
+            half: false,
+        };
+        let tc1 = SigElement {
+            name: "TEXCOORD".into(),
+            index: 1,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(1),
+            col: 0,
+            cols: 3,
+            usage: 0b0111,
+            half: false,
+        };
+        let unallocated = SigElement {
+            name: "sv_sampleindex".into(),
+            index: 0,
+            kind: 12,
+            comp: 5,
+            interp: 1,
+            row: None,
+            col: 2,
+            cols: 1,
+            usage: 0b0001,
+            half: false,
+        };
+        let bytes = signature(&[pos, tc0, tc1, unallocated], true);
+        let parsed = crate::emit::signature(&bytes).unwrap();
+        assert_eq!(parsed.len(), 4);
+        assert_eq!(parsed[0].name, "SV_Position");
+        // Row 1 keeps element order (`TEXCOORD0` at col 3 before `TEXCOORD1` at col 0).
+        assert_eq!((parsed[1].index, parsed[1].col, parsed[1].cols), (0, 3, 1));
+        assert_eq!((parsed[2].index, parsed[2].col, parsed[2].cols), (1, 0, 3));
+        // Unallocated element last, canonical name, unshifted mask & usage.
+        assert_eq!(parsed[3].name, "SV_SampleIndex");
+        assert_eq!((parsed[3].row, parsed[3].col, parsed[3].cols), (None, 0, 1));
+        assert_eq!(bytes[8 + 32 * 3 + 24], 0b0001);
+        assert_eq!(bytes[8 + 32 * 3 + 25], 0b0001);
     }
 }
