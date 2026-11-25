@@ -1344,6 +1344,267 @@ fn ds_min_max_f32_are_atomic_across_waves() {
 }
 
 #[test]
+fn lds_out_of_bounds_reads_zero_and_drops_writes() {
+    let ds_off = |op: u8, vdst: u8, addr: u8, data0: u8, off0: u8, off1: u8| -> [u32; 2] {
+        [
+            0x36 << 26 | (op as u32) << 18 | (off1 as u32) << 8 | off0 as u32,
+            (vdst as u32) << 24 | (data0 as u32) << 8 | addr as u32,
+        ]
+    };
+    let vopc = |op: u8, src0: u16, vsrc1: u8| -> u32 {
+        0x3E << 25 | (op as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+    };
+    const DS_WRITE_B8: u8 = 0x1E;
+    const DS_ADD_RTN_U32: u8 = 0x20;
+    const DS_READ2_B32: u8 = 0x37;
+    const DS_READ_I8: u8 = 0x39;
+
+    // 1. OOB ds_write_b32 / ds_read_b32: OOB read returns 0, OOB write drops without clobbering LDS[0].
+    let mut b32 = vec![vop1(0x001, 5, 0x80)];
+    b32.extend(ds(DS_WRITE_B32, 0, 5, 2)); // LDS[0] = v2
+    b32.push(S_BARRIER);
+    b32.extend(ds(DS_WRITE_B32, 0, 1, 3)); // LDS[v1] = v3
+    b32.push(S_BARRIER);
+    b32.extend(ds(DS_READ_B32, 6, 1, 0)); // v6 = LDS[v1]
+    b32.extend(ds(DS_READ_B32, 7, 5, 0)); // v7 = LDS[0]
+    b32.extend(vop3(0x0C2, 6, vgpr(4), 0x80, 0)); // s6 = (v4 == 0)
+    b32.extend(vop3(0x101, 0, vgpr(7), vgpr(6), sgpr(6))); // v0 = v4 == 0 ? v6 : v7
+    let b32_shader = build_cs(&b32, 64, 512);
+    let b32_cases: &[([u32; 4], u32)] = &[
+        ([512, 0x1234_5678, 0xAABB_CCDD, 0], 0),
+        ([512, 0x1234_5678, 0xAABB_CCDD, 1], 0x1234_5678),
+        ([1024, 0x1234_5678, 0xAABB_CCDD, 0], 0),
+        ([0x8000_0000, 0x1234_5678, 0xAABB_CCDD, 0], 0),
+        ([0xFFFF_FFF0, 0x1234_5678, 0xAABB_CCDD, 0], 0),
+        ([0xFFFF_FFF0, 0x1234_5678, 0xAABB_CCDD, 1], 0x1234_5678),
+        ([508, 0x1234_5678, 0xAABB_CCDD, 0], 0xAABB_CCDD),
+    ];
+    let b32_in: Vec<[u32; 4]> = b32_cases.iter().map(|c| c.0).collect();
+    run_cases(&b32_shader, &b32_in, |backend, i, inp, got| {
+        let want = b32_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: ds_write_b32/ds_read_b32 addr={:#x} sel={} gave {got:#010x}, want {want:#010x}",
+            inp[0], inp[3],
+        );
+    });
+
+    // 2. 32-bit address wrap (addr + 16): 0xFFFF_FFF0 + 16 wraps to 0 (in bounds); 496 + 16 = 512 (OOB).
+    let mut wrap = vec![vop1(0x001, 5, 0x80)];
+    wrap.extend(ds(DS_WRITE_B32, 0, 5, 2)); // LDS[0] = v2
+    wrap.push(S_BARRIER);
+    wrap.extend(ds_off(DS_WRITE_B32, 0, 1, 3, 16, 0)); // LDS[v1 + 16] = v3
+    wrap.push(S_BARRIER);
+    wrap.extend(ds_off(DS_READ_B32, 6, 1, 0, 16, 0)); // v6 = LDS[v1 + 16]
+    wrap.extend(ds(DS_READ_B32, 7, 5, 0)); // v7 = LDS[0]
+    wrap.extend(vop3(0x0C2, 6, vgpr(4), 0x80, 0));
+    wrap.extend(vop3(0x101, 0, vgpr(7), vgpr(6), sgpr(6)));
+    let wrap_shader = build_cs(&wrap, 64, 512);
+    let wrap_cases: &[([u32; 4], u32)] = &[
+        ([0u32.wrapping_sub(16), 0x1122_3344, 0xDEAD_BEEF, 0], 0xDEAD_BEEF),
+        ([496, 0x1122_3344, 0xDEAD_BEEF, 0], 0),
+        ([496, 0x1122_3344, 0xDEAD_BEEF, 1], 0x1122_3344),
+    ];
+    let wrap_in: Vec<[u32; 4]> = wrap_cases.iter().map(|c| c.0).collect();
+    run_cases(&wrap_shader, &wrap_in, |backend, i, inp, got| {
+        let want = wrap_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: ds wrap addr={:#x} + 16 sel={} gave {got:#010x}, want {want:#010x}",
+            inp[0], inp[3],
+        );
+    });
+
+    // 3. OOB ds_write_b8 / ds_read_i8: OOB read returns 0 (not sign-extended -1), OOB write drops.
+    let mut b8 = vec![vop1(0x001, 5, 0x80)];
+    b8.extend(ds(DS_WRITE_B32, 0, 5, 2)); // LDS[0] = v2
+    b8.push(S_BARRIER);
+    b8.extend(ds(DS_WRITE_B8, 0, 1, 3)); // LDS.u8[v1] = v3
+    b8.push(S_BARRIER);
+    b8.extend(ds(DS_READ_I8, 6, 1, 0)); // v6 = sext(LDS.i8[v1])
+    b8.extend(ds(DS_READ_B32, 7, 5, 0)); // v7 = LDS[0]
+    b8.extend(vop3(0x0C2, 6, vgpr(4), 0x80, 0));
+    b8.extend(vop3(0x101, 0, vgpr(7), vgpr(6), sgpr(6)));
+    let b8_shader = build_cs(&b8, 64, 512);
+    let b8_cases: &[([u32; 4], u32)] = &[
+        ([512, 0x1122_3344, 0xFF, 0], 0),
+        ([513, 0x1122_3344, 0x80, 0], 0),
+        ([512, 0x1122_3344, 0xFF, 1], 0x1122_3344),
+        ([3, 0x1122_3344, 0x80, 0], 0xFFFF_FF80),
+    ];
+    let b8_in: Vec<[u32; 4]> = b8_cases.iter().map(|c| c.0).collect();
+    run_cases(&b8_shader, &b8_in, |backend, i, inp, got| {
+        let want = b8_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: ds_write_b8/ds_read_i8 addr={:#x} sel={} gave {got:#010x}, want {want:#010x}",
+            inp[0], inp[3],
+        );
+    });
+
+    // 4. OOB ds_read2_b32: lane 0 in-bounds at 508, lane 1 OOB at 512 -> (LDS[508], 0).
+    let mut r2 = vec![vop1(0x001, 5, 0x80)];
+    r2.extend(ds(DS_WRITE_B32, 0, 5, 3)); // LDS[0] = v3
+    r2.extend([vop1(0x001, 5, 0xFF), 508]); // v5 = 508
+    r2.extend(ds(DS_WRITE_B32, 0, 5, 2)); // LDS[508] = v2
+    r2.push(S_BARRIER);
+    r2.extend(ds_off(DS_READ2_B32, 6, 1, 0, 0, 1)); // v[6:7] = (LDS[v1], LDS[v1 + 4])
+    r2.extend(vop3(0x0C2, 6, vgpr(4), 0x80, 0));
+    r2.extend(vop3(0x101, 0, vgpr(7), vgpr(6), sgpr(6)));
+    let r2_shader = build_cs(&r2, 64, 512);
+    let r2_cases: &[([u32; 4], u32)] = &[
+        ([508, 0x5566_7788, 0x1122_3344, 0], 0x5566_7788),
+        ([508, 0x5566_7788, 0x1122_3344, 1], 0),
+        ([512, 0x5566_7788, 0x1122_3344, 0], 0),
+        ([512, 0x5566_7788, 0x1122_3344, 1], 0),
+    ];
+    let r2_in: Vec<[u32; 4]> = r2_cases.iter().map(|c| c.0).collect();
+    run_cases(&r2_shader, &r2_in, |backend, i, inp, got| {
+        let want = r2_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: ds_read2_b32 addr={:#x} half={} gave {got:#010x}, want {want:#010x}",
+            inp[0], inp[3],
+        );
+    });
+
+    // 5. Masked ds_add_rtn_u32: active OOB lanes return 0 and drop writes; EXEC-masked lanes keep old VGPR.
+    let mut rtn = vec![vop1(0x001, 5, 0x80)];
+    rtn.extend(ds(DS_WRITE_B32, 0, 5, 2)); // LDS[0] = v2
+    rtn.extend([vop1(0x001, 6, 0xFF), 0xCAFE_BABE]); // v6 = 0xCAFE_BABE
+    rtn.push(S_BARRIER);
+    rtn.push(s_mov_b32(12, 126)); // s12 = exec_lo
+    rtn.push(vop2(0x1B, 7, 0x81, 0)); // v_and_b32 v7, 1, v0
+    rtn.push(vopc(0xD2, 0x80, 7)); // v_cmpx_eq_u32 0, v7 (even lanes active)
+    rtn.extend(ds(DS_ADD_RTN_U32, 6, 1, 3)); // v6 = atomic_add(LDS[v1], v3)
+    rtn.push(s_mov_b32(126, 12)); // restore exec_lo
+    rtn.push(vop2(0x25, 7, vgpr(0), 0)); // v7 = v0 * 2
+    rtn.push(vop2(0x25, 7, vgpr(7), 7)); // v7 = v0 * 4
+    rtn.push(vop2(0x25, 7, 0x90, 7)); // v7 = 16 + v0 * 4
+    rtn.extend(ds(DS_WRITE_B32, 0, 7, 6)); // LDS[16 + tid*4] = v6
+    rtn.push(S_BARRIER);
+    rtn.extend(ds(DS_READ_B32, 0, 4, 0)); // v0 = LDS[v4]
+    let rtn_shader = build_cs(&rtn, 64, 512);
+    let rtn_cases: &[([u32; 4], u32)] = &[
+        ([512, 0x1122_3344, 7, 0], 0x1122_3344),
+        ([512, 0x1122_3344, 7, 16], 0),
+        ([512, 0x1122_3344, 7, 20], 0xCAFE_BABE),
+        ([0, 0x1122_3344, 1, 20], 0xCAFE_BABE),
+        ([0, 0x1122_3344, 1, 0], 0x1122_3344 + 32),
+    ];
+    let rtn_in: Vec<[u32; 4]> = rtn_cases.iter().map(|c| c.0).collect();
+    run_cases(&rtn_shader, &rtn_in, |backend, i, inp, got| {
+        let want = rtn_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: masked ds_add_rtn_u32 addr={:#x} off={} gave {got:#010x}, want {want:#010x}",
+            inp[0], inp[3],
+        );
+    });
+
+    // 6. Non-512-byte-aligned DXIL LDS (`s.lds_dwords = 129` via wave64 halves):
+    // RDNA2 rounds hardware LDS up to 1024 bytes, so OOB writes at 516..1020
+    // succeed on hardware unless explicitly bounds-checked.
+    let prev_wave = lower::TEST_HOST_WAVE.replace(Some(32));
+    let mut non_512_words = Vec::new();
+    non_512_words.push(s_mov_b32(5, 0x80));
+    non_512_words.extend_from_slice(&s_load_dwordx4(8, 4));
+    for i in 0..4u8 {
+        non_512_words.push(vop1(0x001, i + 1, sgpr(i)));
+    }
+    non_512_words.extend_from_slice(&ds(DS_WRITE_B32, 0, 1, 2)); // LDS[v1] = v2
+    non_512_words.push(S_BARRIER);
+    non_512_words.extend_from_slice(&ds(DS_READ_B32, 0, 1, 0)); // v0 = LDS[v1]
+    non_512_words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    non_512_words.push(S_ENDPGM);
+    let non_512_code: Vec<u8> = non_512_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let non_512_native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: (5 << 1) | ((512 / 512) << 15),
+            threads: [64, 1, 1],
+        }),
+        code: non_512_code,
+    };
+    let p = ir::build(&non_512_native.code, non_512_native.wave64, non_512_native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &non_512_native.layout, non_512_native.stage, Some(&st))
+        .expect("resource::track");
+    let io = io::raise(&p, &non_512_native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &non_512_native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    lower::TEST_HOST_WAVE.set(prev_wave);
+    let non_512_shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
+    run_cases_on(
+        &non_512_shader,
+        &[
+            [512, 0xAABB_CCDD, 0, 0],
+            [516, 0xAABB_CCDD, 0, 0],
+            [508, 0xAABB_CCDD, 0, 0],
+        ],
+        &[("hardware", false)],
+        |backend, i, inp, got| {
+            let want = [0, 0, 0xAABB_CCDD][i];
+            assert_eq!(
+                got, want,
+                "{backend}: non-512-aligned LDS addr={} gave {got:#010x}, want {want:#010x}",
+                inp[0],
+            );
+        },
+    );
+}
+
+#[test]
 fn v_cmp_class_f16_matches_rdna2() {
     // v_cmp_class_f16_e64 s6, v1, v2 (VOP3 opcode 0x08f); v_cndmask_b32_e64 v0, 0, 1, s6
     let cmp_lo = build_valu_cs(&[

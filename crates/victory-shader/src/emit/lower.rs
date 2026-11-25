@@ -4502,20 +4502,33 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
-        if self.s.lds_dwords == 0 {
+        let console_lds_dwords = self
+            .exchange
+            .as_ref()
+            .map(|e| e.0)
+            .or(self.halves)
+            .unwrap_or(self.s.lds_dwords);
+        if console_lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as dword-aligned and in bounds
-        // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        // shortcut: LDS addresses are taken as dword-aligned; out-of-bounds
+        // console accesses read 0 and drop writes.
+        let dword = |l: &mut Self, bytes: u32| -> (V, V) {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let n = l.s.m.i32(console_lds_dwords);
+            let inside = l.s.m.cmp(c, pred::IULT, index, n);
+            let zero = l.s.m.i32(0);
+            let safe_idx = l.s.m.select(c, inside, index, zero);
             let lds = l.s.lds();
-            l.s.m.element(c, lds, index)
+            (l.s.m.element(c, lds, safe_idx), inside)
+        };
+        let on = |l: &mut Self, inside: V| -> V {
+            guard.map_or(inside, |g| l.s.m.bin(l.cur, Bin::And, g, inside))
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -4549,7 +4562,7 @@ impl<'a> Lower<'a> {
                 || name.ends_with("_d16_hi")
         });
         if let Some(bits) = sub {
-            let p = dword(self, offset);
+            let (p, inside) = dword(self, offset);
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, a, o);
             let three = self.s.m.i32(3);
@@ -4559,6 +4572,8 @@ impl<'a> Lower<'a> {
             if name.starts_with("ds_read") {
                 let reg = dst_reg.ok_or("an LDS read result")?;
                 let w = self.s.m.load(c, p);
+                let zero = self.s.m.i32(0);
+                let w = self.s.m.select(c, inside, w, zero);
                 let x = self.s.m.bin(c, Bin::LShr, w, sh);
                 let x = if base.contains("_i") {
                     let k = self.s.m.i32(32 - bits);
@@ -4601,7 +4616,8 @@ impl<'a> Lower<'a> {
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, m, ones);
                 use super::bitcode::Rmw;
-                let at = self.begin_guarded(guard);
+                let cond = on(self, inside);
+                let at = self.begin_guarded(Some(cond));
                 self.s.m.atomic(self.cur, Rmw::And, p, keep);
                 self.s.m.atomic(self.cur, Rmw::Or, p, x);
                 self.end_guarded(at, &[]);
@@ -4620,8 +4636,11 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
-                    let x = self.s.m.load(self.cur, p);
+                    let (p, inside) = dword(self, off + 4 * k);
+                    let c = self.cur;
+                    let x = self.s.m.load(c, p);
+                    let zero = self.s.m.i32(0);
+                    let x = self.s.m.select(c, inside, x, zero);
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -4643,12 +4662,13 @@ impl<'a> Lower<'a> {
                     stores.push((off + 4 * k as u32, x));
                 }
             }
-            let at = self.begin_guarded(guard);
             for (off, x) in stores {
-                let p = dword(self, off);
+                let (p, inside) = dword(self, off);
+                let cond = on(self, inside);
+                let at = self.begin_guarded(Some(cond));
                 self.s.m.store(self.cur, p, x);
+                self.end_guarded(at, &[]);
             }
-            self.end_guarded(at, &[]);
             return Ok(());
         }
         // Atomics: the old value returns with `_rtn`.
@@ -4677,35 +4697,40 @@ impl<'a> Lower<'a> {
             None => None,
         };
         let old_reg = dst_reg.and_then(|r| inst.read(Reg::V(r)).map(|v| (r, v)));
-        let outside = match old_reg {
-            Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
-            None => self.s.m.i32(0),
+        let zero = self.s.m.i32(0);
+        let old_val = match old_reg {
+            Some((_, v)) => self.i32_of(v).unwrap_or(zero),
+            None => zero,
         };
-        let p = dword(self, offset);
-        if let Some(max) = match op.as_str() {
-            "max_f32" => Some(true),
-            "min_f32" => Some(false),
-            _ => None,
-        } {
-            let at = self.begin_guarded(guard);
-            let r = self.lds_float_min_max(p, v0, max);
-            let r = self.end_guarded(at, &[(r, outside)])[0];
-            if let Some(reg) = dst_reg {
-                self.write(inst, Reg::V(reg), r, None);
-            }
-            return Ok(());
+        let outside = match guard {
+            Some(g) => self.s.m.select(self.cur, g, zero, old_val),
+            None => zero,
+        };
+        enum DsAtomic {
+            FloatMinMax(bool),
+            Rmw(Rmw),
+            CmpXchg(V),
         }
-        let at = self.begin_guarded(guard);
-        let r = match rmw {
-            Some(op) => self.s.m.atomic(self.cur, op, p, v0),
-            // Compare with data0, store data1.
-            None => self
-                .s
-                .m
-                .cmpxchg(self.cur, p, v0, v1.ok_or("an LDS compare")?),
+        let kind = match op.as_str() {
+            "max_f32" => DsAtomic::FloatMinMax(true),
+            "min_f32" => DsAtomic::FloatMinMax(false),
+            _ => match rmw {
+                Some(op) => DsAtomic::Rmw(op),
+                None => DsAtomic::CmpXchg(v1.ok_or("an LDS compare")?),
+            },
         };
-        let r = self.end_guarded(at, &[(r, outside)])[0];
-        if let Some(reg) = dst_reg {
+        let (p, inside) = dword(self, offset);
+        let cond = on(self, inside);
+        let at = self.begin_guarded(Some(cond));
+        let r = match kind {
+            DsAtomic::FloatMinMax(max) => self.lds_float_min_max(p, v0, max),
+            DsAtomic::Rmw(op) => self.s.m.atomic(self.cur, op, p, v0),
+            // Compare with data0, store data1.
+            DsAtomic::CmpXchg(cmp) => self.s.m.cmpxchg(self.cur, p, v0, cmp),
+        };
+        let values = dst_reg.map(|_| (r, outside));
+        let r = self.end_guarded(at, values.as_slice());
+        if let (Some(reg), Some(&r)) = (dst_reg, r.first()) {
             self.write(inst, Reg::V(reg), r, None);
         }
         Ok(())
