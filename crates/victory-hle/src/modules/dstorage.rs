@@ -924,13 +924,25 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         .file;
     let started = std::time::Instant::now();
     let mut done = 0;
+    let mut retries = 0;
     let result = loop {
         if done == out.len() {
+            if retries > 0 {
+                tracing::warn!(offset = request.offset, retries, "dstorage: raw file read recovered");
+            }
             break Ok(());
         }
         match file.seek_read(&mut out[done..], request.offset + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
+            // Retry only the raw file-to-title path on ERROR_INVALID_USER_BUFFER.
+            // Keep any bytes already read and report the original error on exhaustion.
+            Err(error) if request.options == 0 && error.raw_os_error() == Some(1784) && retries < 3 => {
+                retries += 1;
+                tracing::warn!(offset = request.offset, done, retries, "dstorage: retrying raw file read");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                victory_gpu::kernel_will_write(out[done..].as_mut_ptr() as usize, out.len() - done);
+            }
             Err(error) => break Err(from_win32(&error)),
         }
     };
