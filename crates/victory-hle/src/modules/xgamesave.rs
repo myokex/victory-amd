@@ -186,29 +186,57 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
             std::fs::remove_dir_all(entry.path())?;
-        } else if let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok()) {
+        } else if let Some(n) = file
+            .strip_prefix('v')
+            .and_then(|n| n.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+        {
             committed.push(n);
         }
     }
     committed.sort_unstable();
-    let Some(&number) = committed.last() else {
+    if committed.is_empty() {
         return Ok(None);
-    };
-    for old in &committed[..committed.len() - 1] {
-        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
     }
-    let version = dir.join(format!("v{number}"));
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
-    let mut names = parse_manifest(&std::fs::read(version.join(MANIFEST))?).ok_or_else(bad)?;
-    let blobs = names.split_off(2);
-    let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad())?;
-    Ok(Some(Version {
-        dir: version,
-        number,
-        name,
-        display,
-        blobs,
-    }))
+    let mut last_err = None;
+    let mut picked = None;
+    for &number in committed.iter().rev() {
+        let version = dir.join(format!("v{number}"));
+        let bytes = match std::fs::read(version.join(MANIFEST)) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let Some(mut names) = parse_manifest(&bytes) else {
+            last_err = Some(bad());
+            continue;
+        };
+        let blobs = names.split_off(2);
+        let Ok([name, display]) = <[String; 2]>::try_from(names) else {
+            last_err = Some(bad());
+            continue;
+        };
+        picked = Some(Version {
+            dir: version,
+            number,
+            name,
+            display,
+            blobs,
+        });
+        break;
+    }
+    let Some(chosen) = picked else {
+        return Err(last_err.unwrap_or_else(bad));
+    };
+    for &old in &committed {
+        if old != chosen.number {
+            std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+        }
+    }
+    Ok(Some(chosen))
 }
 
 /// The version of container `name` in `dir`; none for a missing container
@@ -470,7 +498,9 @@ impl Update {
         }
         let display = self.display.as_deref();
         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
-        let number = current.as_ref().map_or(1, |v| v.number + 1);
+        let Some(number) = current.as_ref().map_or(Some(1), |v| v.number.checked_add(1)) else {
+            return NO_ACCESS;
+        };
         if let Err(e) = commit(&self.dir, number, &self.name, display.unwrap_or(""), &blobs) {
             return io_error(&self.dir, &e);
         }
@@ -1351,5 +1381,42 @@ mod tests {
         assert!(found.is_empty());
         close_container(this, container);
         close_provider(this, provider);
+    }
+
+    #[test]
+    fn u64_max_version_and_stray_dirs_preserve_save() {
+        // 1. Committed version at u64::MAX must fail cleanly with NO_ACCESS rather than
+        //    panicking/wrapping to v0 and clobbering the save.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
+        let cdir = container_dir(root, "Slot");
+        std::fs::rename(cdir.join("v1"), cdir.join(format!("v{}", u64::MAX))).unwrap();
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), NO_ACCESS);
+        assert!(!cdir.join("v0").exists());
+        assert_eq!(state(root), old_state());
+
+        // 2. Stray v0 or manifest-less v<u64::MAX> alongside committed v1 must not delete v1.
+        let dir2 = tempfile::tempdir().unwrap();
+        let root2 = dir2.path();
+        assert_eq!(
+            update(root2, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
+        let cdir2 = container_dir(root2, "Slot");
+        std::fs::create_dir(cdir2.join("v0")).unwrap();
+        std::fs::create_dir(cdir2.join(format!("v{}", u64::MAX))).unwrap();
+        assert_eq!(state(root2), old_state());
+        assert_eq!(update(root2, "two", &[("a", Some("new a"))]), S_OK);
+        assert_eq!(
+            state(root2),
+            Some((
+                "two".into(),
+                vec![("a".into(), "new a".into()), ("b".into(), "old b".into())]
+            ))
+        );
     }
 }
