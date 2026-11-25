@@ -202,10 +202,14 @@ enum Blob {
 
 impl Blob {
     /// The library file in `dir`: a library a save left beside it
-    /// ([`NEXT_FILE`]) takes its place first.
+    /// (`next`) takes its place first.
     fn of(dir: &std::path::Path) -> Blob {
-        let path = dir.join(LIBRARY_FILE);
-        let next = dir.join(NEXT_FILE);
+        Blob::of_files(dir, cache_files())
+    }
+
+    fn of_files(dir: &std::path::Path, files: CacheFiles) -> Blob {
+        let path = dir.join(files.library);
+        let next = dir.join(files.next);
         if next.exists() && std::fs::rename(&next, &path).is_err() {
             tracing::warn!("the host pipeline library saved last could not take the old one's place");
         }
@@ -434,15 +438,48 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
+/// Separate cache files for the WARP software adapter so diagnostic runs do
+/// not overwrite or reject the hardware pipeline cache.
+const WARP_LIBRARY_FILE: &str = "host-pipelines-warp.bin";
+const WARP_NEXT_FILE: &str = "host-pipelines-warp.next";
+const WARP_EARLY_FILE: &str = "early-pipelines-warp.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CacheFiles {
+    library: &'static str,
+    next: &'static str,
+    early: &'static str,
+}
+
+const HARDWARE_FILES: CacheFiles = CacheFiles {
+    library: LIBRARY_FILE,
+    next: NEXT_FILE,
+    early: EARLY_FILE,
+};
+
+const WARP_FILES: CacheFiles = CacheFiles {
+    library: WARP_LIBRARY_FILE,
+    next: WARP_NEXT_FILE,
+    early: WARP_EARLY_FILE,
+};
+
+fn files_for(warp: bool) -> CacheFiles {
+    if warp { WARP_FILES } else { HARDWARE_FILES }
+}
+
+fn cache_files() -> CacheFiles {
+    files_for(crate::host::is_warp())
+}
 
 fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
+            let files = cache_files();
+            let blob = DIR.get().map_or(Blob::None, |d| Blob::of_files(d, files));
             let library = open(&device, blob);
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -577,11 +614,12 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    let files = cache_files();
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    let tmp = dir.join(files.library).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
@@ -614,10 +652,10 @@ pub(crate) fn save(now: bool) {
     // (`victory warm`) wrote an empty list over theirs, and the next world
     // began with every pipeline still to be asked for.
     let used: Vec<String> = used().iter().flatten().cloned().collect();
-    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+    let library_written = if bytes > 0 { replace_library_in(dir, &tmp, files) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
-        let in_place = !dir.join(NEXT_FILE).exists();
+        let in_place = !dir.join(files.next).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
             REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
             REPLACED[0].fetch_add(1, Ordering::Relaxed);
@@ -630,7 +668,7 @@ pub(crate) fn save(now: bool) {
         });
     }
     let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+        .and_then(|()| write_atomically(&dir.join(files.early), used.join("\n").as_bytes()));
     match written {
         Ok(()) => tracing::info!(
             bytes,
@@ -670,7 +708,11 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// stay: the rest read as zeros). Where a system refuses, the new library
 /// is left beside it as [`NEXT_FILE`] for the next start.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    replace_library_in(dir, tmp, cache_files())
+}
+
+fn replace_library_in(dir: &std::path::Path, tmp: &std::path::Path, files: CacheFiles) -> std::io::Result<()> {
+    std::fs::rename(tmp, dir.join(files.library)).or_else(|_| std::fs::rename(tmp, dir.join(files.next)))
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -686,11 +728,12 @@ static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
 fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
+    let files = cache_files();
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
     if used.is_none() {
         let listed = DIR
             .get()
-            .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
+            .and_then(|d| std::fs::read_to_string(d.join(files.early)).ok())
             .unwrap_or_default();
         let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
         tracing::info!(pipelines = set.len(), "title pipelines to start early");
@@ -746,7 +789,8 @@ mod tests {
     #[test]
     fn the_library_file_is_mapped_and_replaced() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(LIBRARY_FILE);
+        let files = cache_files();
+        let path = dir.path().join(files.library);
         assert!(matches!(Blob::of(dir.path()), Blob::None), "no file yet");
         std::fs::write(&path, b"").unwrap();
         assert!(matches!(Blob::of(dir.path()), Blob::None), "an empty file");
@@ -770,7 +814,7 @@ mod tests {
         drop(blob);
         // The next start reads the new one, wherever the save left it.
         assert_eq!(Blob::of(dir.path()).bytes(), &new[..]);
-        assert!(!dir.path().join(NEXT_FILE).exists());
+        assert!(!dir.path().join(files.next).exists());
     }
 
     /// The bytes at `at` of the pattern the test below writes.
@@ -840,5 +884,100 @@ mod tests {
             pattern(page * 4096, &mut expected);
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
+    }
+
+    #[test]
+    fn warp_and_hardware_cache_files_are_isolated() {
+        let hw = files_for(false);
+        let warp = files_for(true);
+        assert_eq!(hw.library, "host-pipelines.bin");
+        assert_eq!(hw.next, "host-pipelines.next");
+        assert_eq!(hw.early, "early-pipelines.txt");
+        assert_eq!(warp.library, "host-pipelines-warp.bin");
+        assert_eq!(warp.next, "host-pipelines-warp.next");
+        assert_eq!(warp.early, "early-pipelines-warp.txt");
+
+        let dir = tempfile::tempdir().unwrap();
+        let hw_bytes = b"hardware-library-bytes";
+        let warp_bytes = b"warp-library-bytes";
+        std::fs::write(dir.path().join(hw.library), hw_bytes).unwrap();
+        std::fs::write(dir.path().join(hw.early), b"hw-early-key\n").unwrap();
+
+        // WARP sees no library when only hardware files exist.
+        assert!(matches!(Blob::of_files(dir.path(), warp), Blob::None));
+
+        // Saving a WARP library leaves hardware files untouched.
+        let warp_tmp = dir.path().join(warp.library).with_extension("tmp");
+        std::fs::write(&warp_tmp, warp_bytes).unwrap();
+        replace_library_in(dir.path(), &warp_tmp, warp).unwrap();
+        write_atomically(&dir.path().join(warp.early), b"warp-early-key\n").unwrap();
+
+        assert_eq!(Blob::of_files(dir.path(), warp).bytes(), warp_bytes);
+        assert_eq!(Blob::of_files(dir.path(), hw).bytes(), hw_bytes);
+        assert_eq!(std::fs::read(dir.path().join(hw.early)).unwrap(), b"hw-early-key\n");
+        assert_eq!(std::fs::read(dir.path().join(warp.early)).unwrap(), b"warp-early-key\n");
+
+        // A staged `.next` WARP file promotes to WARP without touching hardware `.next` or `.bin`.
+        let warp_next = b"warp-next-bytes";
+        std::fs::write(dir.path().join(warp.next), warp_next).unwrap();
+        assert_eq!(Blob::of_files(dir.path(), warp).bytes(), warp_next);
+        assert!(!dir.path().join(warp.next).exists());
+        assert_eq!(std::fs::read(dir.path().join(hw.library)).unwrap(), hw_bytes);
+    }
+
+    #[test]
+    fn warp_library_open_and_save_leaves_hardware_files_untouched() {
+        let Some(hw_host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let Ok(hw_device) = hw_host.device.cast::<ID3D12Device1>() else {
+            return;
+        };
+        let Ok(warp_adapter) = crate::host::warp_adapter() else {
+            return; // no WARP adapter here
+        };
+        let mut raw_warp: Option<ID3D12Device> = None;
+        // SAFETY: plain D3D12 WARP device creation for test isolation check.
+        let Ok(()) = (unsafe { D3D12CreateDevice(&warp_adapter, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0, &mut raw_warp) }) else {
+            return;
+        };
+        let Some(Ok(warp_device)) = raw_warp.map(|d| d.cast::<ID3D12Device1>()) else {
+            return;
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Save a real hardware pipeline library and early list.
+        let hw_lib = open(&hw_device, Blob::None).expect("hardware empty library");
+        // SAFETY: plain query on a live library.
+        let hw_size = unsafe { hw_lib.library.GetSerializedSize() };
+        let hw_tmp = dir.path().join(HARDWARE_FILES.library).with_extension("tmp");
+        serialise(&hw_lib.library, &hw_tmp, hw_size).expect("serialise hardware library");
+        replace_library_in(dir.path(), &hw_tmp, HARDWARE_FILES).expect("write hardware library");
+        write_atomically(&dir.path().join(HARDWARE_FILES.early), b"hw-pipeline-1\n").expect("write hardware early list");
+        drop(hw_lib);
+
+        let hw_saved = std::fs::read(dir.path().join(HARDWARE_FILES.library)).unwrap();
+        let hw_early_saved = std::fs::read(dir.path().join(HARDWARE_FILES.early)).unwrap();
+        assert!(!hw_saved.is_empty());
+
+        // Open and save on WARP using WARP_FILES: must start empty and keep hardware files intact.
+        let warp_initial_blob = Blob::of_files(dir.path(), WARP_FILES);
+        assert!(matches!(warp_initial_blob, Blob::None));
+        let warp_lib = open(&warp_device, warp_initial_blob).expect("WARP empty library");
+        // SAFETY: plain query on a live library.
+        let warp_size = unsafe { warp_lib.library.GetSerializedSize() };
+        let warp_tmp = dir.path().join(WARP_FILES.library).with_extension("tmp");
+        serialise(&warp_lib.library, &warp_tmp, warp_size).expect("serialise WARP library");
+        replace_library_in(dir.path(), &warp_tmp, WARP_FILES).expect("write WARP library");
+        write_atomically(&dir.path().join(WARP_FILES.early), b"warp-pipeline-1\n").expect("write WARP early list");
+        drop(warp_lib);
+
+        // Reopen WARP library from its own file and confirm hardware files did not change.
+        let warp_reopened = open(&warp_device, Blob::of_files(dir.path(), WARP_FILES)).expect("reopen WARP library");
+        assert!(!matches!(warp_reopened._blob, Blob::None));
+        assert_eq!(std::fs::read(dir.path().join(HARDWARE_FILES.library)).unwrap(), hw_saved);
+        assert_eq!(std::fs::read(dir.path().join(HARDWARE_FILES.early)).unwrap(), hw_early_saved);
+        assert_eq!(std::fs::read(dir.path().join(WARP_FILES.early)).unwrap(), b"warp-pipeline-1\n");
     }
 }

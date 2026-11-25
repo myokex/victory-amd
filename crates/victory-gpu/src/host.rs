@@ -57,6 +57,8 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// Whether the device runs on the WARP software adapter.
+    warp: bool,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -635,7 +637,8 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        let mut warp = cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some();
+        if warp {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -698,6 +701,7 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        warp = warp || adapter.as_ref().is_some_and(adapter_is_software);
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -714,6 +718,7 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            warp,
         })
     }
 }
@@ -788,6 +793,22 @@ mod caption_tests {
         assert_eq!(short_name(""), "");
         assert!(super::caption_name().starts_with("VIctory - myokex"));
     }
+}
+
+/// Whether `adapter` is a DXGI software adapter (such as WARP).
+fn adapter_is_software(adapter: &IDXGIAdapter3) -> bool {
+    // SAFETY: plain DXGI adapter query on a live adapter.
+    unsafe {
+        adapter
+            .cast::<IDXGIAdapter1>()
+            .and_then(|a| a.GetDesc1())
+            .is_ok_and(|desc| desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+    }
+}
+
+/// Whether the host D3D12 device is running on the WARP software adapter.
+pub(crate) fn is_warp() -> bool {
+    host().is_some_and(|h| h.warp)
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
