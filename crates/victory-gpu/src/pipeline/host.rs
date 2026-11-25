@@ -1006,9 +1006,6 @@ mod tests {
         }
     }
 
-    /// A mesh pipeline made once is loaded from the library the next time,
-    /// not compiled again (a stream without a topology never loads).
-
     /// A pipeline with the depth bounds test is made, and loads again.
     #[test]
     fn a_pipeline_with_depth_bounds_is_made() {
@@ -1047,6 +1044,8 @@ mod tests {
         }
     }
 
+    /// A mesh pipeline made once is loaded from the library the next time,
+    /// not compiled again (a stream without a topology never loads).
     #[test]
     fn a_mesh_pipeline_loads_from_the_library() {
         let Some(host) = host() else {

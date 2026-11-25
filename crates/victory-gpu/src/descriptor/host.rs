@@ -2844,7 +2844,7 @@ mod tests {
         let before = print(&memory);
         assert_eq!(print(&memory), before);
         let last = memory.len() - 1;
-        for at in [0, (memory.len() - 4096) / 11 * 5 & !0xfff, last] {
+        for at in [0, ((memory.len() - 4096) / 11 * 5) & !0xfff, last] {
             memory[at] ^= 1;
             assert_ne!(print(&memory), before, "byte {at}");
             memory[at] ^= 1;
