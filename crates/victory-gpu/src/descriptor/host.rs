@@ -1535,9 +1535,13 @@ impl HostHeap {
         if key == 0 {
             return;
         }
-        match view_at(key as u32, (key >> 32) as u32) {
-            Some(view) => null_for(&view, self.cpu(index)),
-            None => null_view(self.cpu(index)),
+        if self.sampler {
+            self.null_sampler(index);
+        } else {
+            match view_at(key as u32, (key >> 32) as u32) {
+                Some(view) => null_for(&view, self.cpu(index)),
+                None => null_view(self.cpu(index)),
+            }
         }
         self.keep(index, None);
     }
@@ -3535,6 +3539,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             // SAFETY: a slot of our heap; a zero location makes a null view.
             return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
         }
+        View::Sampler(..) | View::ConsoleSampler(..) => return null_sampler(at),
         _ => return null_view(at),
     };
     let desc = if buffer {
