@@ -756,6 +756,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
@@ -782,6 +783,7 @@ mod tests {
         }
     }
     use super::container::SigElement;
+    #[cfg(windows)]
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
@@ -1303,6 +1305,7 @@ mod tests {
         let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
+        #[cfg_attr(not(windows), allow(unused_variables))]
         let l = super::lower::lower(&super::lower::Parts {
             native: &native,
             p: &p,
@@ -1315,6 +1318,7 @@ mod tests {
             mesh_stride: 0,
         })
         .unwrap();
+        #[cfg(windows)]
         let mut dxil = l.dxil;
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
