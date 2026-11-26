@@ -128,6 +128,13 @@ fn hot_textures() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HOT").is_none_or(|v| v != "0"))
 }
 
+/// Whether linear textures of one level are hashed at every check
+/// (`VICTORY_TEXTURE_FILM=1`; off by default).
+fn film_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FILM").is_some_and(|v| v == "1"))
+}
+
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
 unsafe impl Send for Staging {}
@@ -1227,7 +1234,14 @@ impl Staging {
                 last.hot_until = frame + HOT_FRAMES;
             }
             let hot = hot_textures() && frame < last.hot_until;
-            if unwritten && !turn && !hot {
+            // `VICTORY_TEXTURE_FILM=1`: linear pictures of one level (the
+            // planes of the boot and loading movies, written through another
+            // view the guard does not see) are hashed at every check, not
+            // only while hot: the loading animation otherwise showed a new
+            // picture only every few frames, in turns with old ones. Ported
+            // from myokex/victory-amd vi-fx3 (c3723f3e, `film`).
+            let film = film_textures() && self.layout.desc.swizzle.0 == 0 && self.layout.desc.mips == 1;
+            if unwritten && !turn && !hot && !film {
                 return 0;
             }
             blind = unwritten;
