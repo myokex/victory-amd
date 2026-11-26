@@ -170,7 +170,7 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
         l if l & !0xff == 0x100 => Swizzle(l & 0xff),
         _ => return None,
     };
-    texture::Texture::new(&TextureDesc {
+    let d = TextureDesc {
         dimension,
         width: u32::try_from(desc.width).ok()?,
         height: desc.height,
@@ -179,7 +179,13 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
         format: desc.format,
         samples: desc.sample_count.max(1),
         swizzle,
-    })
+    };
+    // With the console's pipes the XOR modes have addresses too (so
+    // `crate::texback` can lay them back); uploads still skip them.
+    match crate::console::xor_pipes() {
+        Some(pipes) => texture::Texture::for_gpu(&d, pipes, 0),
+        None => texture::Texture::new(&d),
+    }
     .ok()
 }
 

@@ -147,7 +147,7 @@ fn texture(desc: &ResourceDesc) -> Option<Texture> {
         l if l & !0xff == SWIZZLED => Swizzle(l & 0xff),
         _ => return None,
     };
-    let texture = Texture::new(&TextureDesc {
+    let d = TextureDesc {
         dimension,
         width: u32::try_from(desc.width).ok()?,
         height: desc.height,
@@ -156,7 +156,13 @@ fn texture(desc: &ResourceDesc) -> Option<Texture> {
         format: desc.format,
         samples: desc.samples.max(1),
         swizzle,
-    })
+    };
+    // The XOR modes have addresses with the console's pipes, unless
+    // `VICTORY_XOR_LAYOUTS=0` (`victory_gpu::console::xor_pipes`).
+    let texture = match victory_gpu::console::xor_pipes() {
+        Some(pipes) => Texture::for_gpu(&d, pipes, 0),
+        None => Texture::new(&d),
+    }
     .ok()?;
     // The layout struct has room for 15 mips.
     (texture.planes[0].layout.mips.len() <= MIPS).then_some(texture)

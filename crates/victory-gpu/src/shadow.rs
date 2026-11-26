@@ -1482,9 +1482,15 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`]: a quarter of the logical cores
+/// (3 on a 6-core, 12-thread processor, 6 on 24), or `VICTORY_WIDE_THREADS=<n>`
+/// (1 to 16).
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static SET: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.trim().parse().ok()).filter(|n| (1..=16).contains(n))
+    });
+    set.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6))
 }
 
 fn workers() -> &'static Workers {

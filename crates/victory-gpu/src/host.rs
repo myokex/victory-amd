@@ -3264,6 +3264,19 @@ fn late_helper() {
 /// Starts the threads of [`late`], once: the one that settles flights when
 /// the card has run them and looks at what queues hold, and with [`relay`]
 /// the one that lands flights.
+/// Whether the submitting thread leaves the landed lists to the helper
+/// thread (`VICTORY_LAND_ASIDE=1`; off by default).
+fn land_aside() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_LAND_ASIDE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("landed lists are reset by the helper thread (VICTORY_LAND_ASIDE=1)");
+        }
+        on
+    })
+}
+
 fn late_threads() {
     static HELPER: std::sync::Once = std::sync::Once::new();
     HELPER.call_once(|| {
@@ -5152,6 +5165,15 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
+        // `VICTORY_LAND_ASIDE=1`: the landed lists are reset and given back by
+        // the helper thread ([`late_helper`]), not by the submitting thread
+        // (after beamdotdev's fxceless/victory-fork PR 1146: about a tenth of
+        // the submitting thread's time on an i5-9600K).
+        if land_aside() {
+            line().poke = true;
+            LINE_MOVED.notify_all();
+            return;
+        }
         let _landing = crate::timeline::span("landed lists reset and given back");
         land();
     }
